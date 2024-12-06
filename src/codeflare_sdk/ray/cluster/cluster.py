@@ -183,44 +183,33 @@ class Cluster:
 
     def apply(self, force=False):
         """
-        Apply the Cluster configuration. The 'force' property is passed to
-        server_side_apply that ignore immutable fields if set to True
+        Apply the Cluster configuration. If 'force' is set to True, the method will attempt to
+        patch the cluster using server-side apply with the force option.
+
         Parameters:
-        - force (bool): Whether to ignore immutable fields if found.
+        - force (bool): Whether to attempt a forced patch even if immutable fields are present.
                         Defaults to False.
         """
-        # Ensure Kubernetes configuration is loaded
-        config_check()
-        # Create a dynamic client for interacting with custom resources
-        dynamic_client = DynamicClient(get_api_client()) 
-        # Get the RayCluster custom resource definition
         try:
-            api = dynamic_client.resources.get(
-                api_version="ray.io/v1",
-                kind="RayCluster"
+            # Load Kubernetes configuration and create a dynamic client
+            k8s_client = k8s_config.new_client_from_config()
+            dynamic_client = DynamicClient(k8s_client)
+
+            # Get the RayCluster resource
+            ray_cluster_api = dynamic_client.resources.get(
+                api_version="ray.io/v1", kind="RayCluster"
             )
-        except Exception as e:
-            raise RuntimeError("Failed to get RayCluster resource: " + str(e))
 
-        # Define the resource body
-        resource_body = self.resource_yaml
-
-        try:
-            # Apply the resource using server-side apply
-            resp = api.server_side_apply(
+            # Perform server-side apply
+            resp = ray_cluster_api.server_side_apply(
                 namespace=self.config.namespace,
-                body=resource_body,
+                body=self.resource_yaml,
                 field_manager="cluster-manager",
-                force=force,  # Forces replacement if needed
+                force=force,  # Pass the force parameter to server_side_apply
             )
-            print(
-                f"Cluster '{self.config.name}' applied successfully. Managed by: {resp.metadata.managedFields[0].manager}"
-            )
+            print(f"Cluster '{self.config.name}' applied successfully.")
         except ApiException as e:
-            if e.status == 404:
-                # Handle the case where the namespace or resource does not exist
-                print(f"Namespace '{self.config.namespace}' or resource not found. Verify the namespace or CRD.")
-            elif e.status == 403:
+            if e.status == 403:
                 print(
                     "Immutable fields detected in the configuration. "
                     "The cluster cannot be patched normally. "
@@ -228,7 +217,8 @@ class Cluster:
                 )
             else:
                 raise RuntimeError(f"Failed to apply cluster: {e.reason}")
-
+    
+    
         def _throw_for_no_raycluster(self):
             api_instance = client.CustomObjectsApi(get_api_client())
             try:
