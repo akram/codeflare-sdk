@@ -190,9 +190,10 @@ class Cluster:
                         Defaults to False.
         """
         try:
-            # Load Kubernetes configuration and create a dynamic client
-            k8s_client = config.new_client_from_config()
-            dynamic_client = DynamicClient(k8s_client)
+            # Ensure Kubernetes configuration is loaded
+            config_check()
+            # Create a dynamic client for interacting with custom resources
+            dynamic_client = DynamicClient(get_api_client())
 
             # Get the RayCluster resource
             ray_cluster_api = dynamic_client.resources.get(
