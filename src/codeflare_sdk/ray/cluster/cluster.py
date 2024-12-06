@@ -56,7 +56,6 @@ from kubernetes.dynamic import DynamicClient
 from kubernetes import client as k8s_client
 from kubernetes.client.rest import ApiException
 
-from kubernetes.client.rest import ApiException
 import warnings
 
 
@@ -192,7 +191,7 @@ class Cluster:
         """
         try:
             # Load Kubernetes configuration and create a dynamic client
-            k8s_client = k8s_config.new_client_from_config()
+            k8s_client = config.new_client_from_config()
             dynamic_client = DynamicClient(k8s_client)
 
             # Get the RayCluster resource
@@ -218,7 +217,7 @@ class Cluster:
             else:
                 raise RuntimeError(f"Failed to apply cluster: {e.reason}")
     
-    
+
         def _throw_for_no_raycluster(self):
             api_instance = client.CustomObjectsApi(get_api_client())
             try:
