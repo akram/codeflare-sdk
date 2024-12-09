@@ -82,7 +82,9 @@ class TestRayClusterApply:
         # Wait for the updated cluster to be ready
         cluster.wait_ready()
         updated_status = cluster.status()
-        assert updated_status["ready"], f"Cluster {cluster_name} is not ready after update: {updated_status}"
+        assert updated_status[
+            "ready"
+        ], f"Cluster {cluster_name} is not ready after update: {updated_status}"
 
         # Verify the cluster is updated
         updated_ray_cluster = get_ray_cluster(cluster_name, namespace)
@@ -152,4 +154,3 @@ class TestRayClusterApply:
 
         # Clean up
         cluster.down()
-
