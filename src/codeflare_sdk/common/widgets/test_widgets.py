@@ -15,7 +15,7 @@
 import codeflare_sdk.common.widgets.widgets as cf_widgets
 import pandas as pd
 from unittest.mock import MagicMock, patch
-from ..utils.unit_test_support import get_local_queue, createClusterConfig
+from ..utils.unit_test_support import get_local_queue, create_cluster_config
 from codeflare_sdk.ray.cluster.cluster import Cluster
 from codeflare_sdk.ray.cluster.status import (
     RayCluster,
@@ -28,7 +28,7 @@ from kubernetes import client
 @patch.dict(
     "os.environ", {"JPY_SESSION_NAME": "example-test"}
 )  # Mock Jupyter environment variable
-def test_cluster_up_down_buttons(mocker):
+def test_cluster_apply_down_buttons(mocker):
     mocker.patch("kubernetes.client.ApisApi.get_api_versions")
     mocker.patch(
         "kubernetes.client.CustomObjectsApi.get_cluster_custom_object",
@@ -38,49 +38,53 @@ def test_cluster_up_down_buttons(mocker):
         "kubernetes.client.CustomObjectsApi.list_namespaced_custom_object",
         return_value=get_local_queue("kueue.x-k8s.io", "v1beta1", "ns", "localqueues"),
     )
-    cluster = Cluster(createClusterConfig())
+    cluster = Cluster(create_cluster_config())
 
-    with patch("ipywidgets.Button") as MockButton, patch(
-        "ipywidgets.Checkbox"
-    ) as MockCheckbox, patch("ipywidgets.Output"), patch("ipywidgets.HBox"), patch(
-        "ipywidgets.VBox"
-    ), patch.object(
-        cluster, "up"
-    ) as mock_up, patch.object(
-        cluster, "down"
-    ) as mock_down, patch.object(
-        cluster, "wait_ready"
-    ) as mock_wait_ready:
+    with (
+        patch("ipywidgets.Button") as MockButton,
+        patch("ipywidgets.Checkbox") as MockCheckbox,
+        patch("ipywidgets.Output"),
+        patch("ipywidgets.HBox"),
+        patch("ipywidgets.VBox"),
+        patch.object(cluster, "apply") as mock_apply,
+        patch.object(cluster, "down") as mock_down,
+        patch.object(cluster, "wait_ready") as mock_wait_ready,
+    ):
         # Create mock button & CheckBox instances
-        mock_up_button = MagicMock()
+        mock_apply_button = MagicMock()
         mock_down_button = MagicMock()
         mock_wait_ready_check_box = MagicMock()
 
         # Ensure the mock Button class returns the mock button instances in sequence
         MockCheckbox.side_effect = [mock_wait_ready_check_box]
-        MockButton.side_effect = [mock_up_button, mock_down_button]
+        MockButton.side_effect = [mock_apply_button, mock_down_button]
 
         # Call the method under test
-        cf_widgets.cluster_up_down_buttons(cluster)
+        cf_widgets.cluster_apply_down_buttons(cluster)
 
         # Simulate checkbox being checked or unchecked
         mock_wait_ready_check_box.value = True  # Simulate checkbox being checked
 
         # Simulate the button clicks by calling the mock on_click handlers
-        mock_up_button.on_click.call_args[0][0](None)  # Simulate clicking "Cluster Up"
+        mock_apply_button.on_click.call_args[0][0](
+            None
+        )  # Simulate clicking "Cluster Apply"
         mock_down_button.on_click.call_args[0][0](
             None
         )  # Simulate clicking "Cluster Down"
 
-        # Check if the `up` and `down` methods were called
+        # Check if the `apply` and `down` methods were called
         mock_wait_ready.assert_called_once()
-        mock_up.assert_called_once()
+        # Widget button uses shorter TLS timeout (60s) to avoid blocking UI
+        mock_apply.assert_called_once_with(timeout=60)
         mock_down.assert_called_once()
 
 
 @patch.dict("os.environ", {}, clear=True)  # Mock environment with no variables
 def test_is_notebook_false():
-    assert cf_widgets.is_notebook() is False
+    # Mock get_ipython to return None (no IPython shell)
+    with patch("IPython.get_ipython", return_value=None):
+        assert cf_widgets.is_notebook() is False
 
 
 @patch.dict(
@@ -88,6 +92,43 @@ def test_is_notebook_false():
 )  # Mock Jupyter environment variable
 def test_is_notebook_true():
     assert cf_widgets.is_notebook() is True
+
+
+@patch.dict("os.environ", {}, clear=True)  # No env vars
+def test_is_notebook_with_zmq_shell():
+    """Test is_notebook returns True when running in ZMQInteractiveShell (Jupyter)."""
+    mock_shell = MagicMock()
+    mock_shell.__class__.__name__ = "ZMQInteractiveShell"
+
+    with patch("IPython.get_ipython", return_value=mock_shell):
+        assert cf_widgets.is_notebook() is True
+
+
+@patch.dict("os.environ", {}, clear=True)  # No env vars
+def test_is_notebook_with_terminal_shell():
+    """Test is_notebook returns False when running in TerminalInteractiveShell (ipython CLI)."""
+    mock_shell = MagicMock()
+    mock_shell.__class__.__name__ = "TerminalInteractiveShell"
+
+    with patch("IPython.get_ipython", return_value=mock_shell):
+        assert cf_widgets.is_notebook() is False
+
+
+@patch.dict(
+    "os.environ", {"JPY_PARENT_PID": "12345"}
+)  # Standard Jupyter environment variable
+def test_is_notebook_with_jpy_parent_pid():
+    """Test is_notebook returns True when JPY_PARENT_PID env var is set."""
+    # Mock get_ipython to return None to test env var fallback
+    with patch("IPython.get_ipython", return_value=None):
+        assert cf_widgets.is_notebook() is True
+
+
+@patch.dict("os.environ", {}, clear=True)  # No env vars
+def test_is_notebook_ipython_import_error():
+    """Test is_notebook handles ImportError gracefully."""
+    with patch.dict("sys.modules", {"IPython": None}):
+        assert cf_widgets.is_notebook() is False
 
 
 def test_view_clusters(mocker, capsys):
@@ -104,7 +145,7 @@ def test_view_clusters(mocker, capsys):
     # Prepare to run view_clusters when notebook environment is detected
     mocker.patch("codeflare_sdk.common.widgets.widgets.is_notebook", return_value=True)
     mock_get_current_namespace = mocker.patch(
-        "codeflare_sdk.ray.cluster.cluster.get_current_namespace",
+        "codeflare_sdk.common.widgets.widgets.get_current_namespace",
         return_value="default",
     )
     namespace = mock_get_current_namespace.return_value
@@ -173,15 +214,11 @@ def test_delete_cluster(mocker, capsys):
         side_effect=[
             mock_ray_cluster,
             client.ApiException(status=404),
-            client.ApiException(status=404),
             mock_ray_cluster,
         ],
     )
 
-    # In this scenario, the RayCluster exists and the AppWrapper does not.
-    mocker.patch(
-        "codeflare_sdk.ray.cluster.cluster._check_aw_exists", return_value=False
-    )
+    # Test RayCluster deletion
     mock_delete_rc = mocker.patch(
         "kubernetes.client.CustomObjectsApi.delete_namespaced_custom_object"
     )
@@ -192,23 +229,6 @@ def test_delete_cluster(mocker, capsys):
         version="v1",
         namespace=namespace,
         plural="rayclusters",
-        name=name,
-    )
-
-    # In this scenario, the AppWrapper exists and the RayCluster does not
-    mocker.patch(
-        "codeflare_sdk.ray.cluster.cluster._check_aw_exists", return_value=True
-    )
-    mock_delete_aw = mocker.patch(
-        "kubernetes.client.CustomObjectsApi.delete_namespaced_custom_object"
-    )
-    cf_widgets._delete_cluster(name, namespace)
-
-    mock_delete_aw.assert_called_once_with(
-        group="workload.codeflare.dev",
-        version="v1beta2",
-        namespace=namespace,
-        plural="appwrappers",
         name=name,
     )
 
@@ -248,7 +268,7 @@ def test_ray_cluster_manager_widgets_init(mocker, capsys):
         return_value=test_ray_clusters_df,
     )
     mocker.patch(
-        "codeflare_sdk.ray.cluster.cluster.get_current_namespace",
+        "codeflare_sdk.common.utils.get_current_namespace",
         return_value=namespace,
     )
     mock_delete_cluster = mocker.patch(
@@ -266,12 +286,12 @@ def test_ray_cluster_manager_widgets_init(mocker, capsys):
     )
 
     # Assertions for DataFrame and attributes
-    assert ray_cluster_manager_instance.ray_clusters_df.equals(
-        test_ray_clusters_df
-    ), "ray_clusters_df attribute does not match the input DataFrame"
-    assert (
-        ray_cluster_manager_instance.namespace == namespace
-    ), f"Expected namespace to be '{namespace}', but got '{ray_cluster_manager_instance.namespace}'"
+    assert ray_cluster_manager_instance.ray_clusters_df.equals(test_ray_clusters_df), (
+        "ray_clusters_df attribute does not match the input DataFrame"
+    )
+    assert ray_cluster_manager_instance.namespace == namespace, (
+        f"Expected namespace to be '{namespace}', but got '{ray_cluster_manager_instance.namespace}'"
+    )
     assert (
         ray_cluster_manager_instance.classification_widget.options
         == test_ray_clusters_df["Name"].tolist()
@@ -287,12 +307,12 @@ def test_ray_cluster_manager_widgets_init(mocker, capsys):
         ray_cluster_manager_instance.classification_widget
         == mock_toggle_buttons.return_value
     ), "classification_widget is not set correctly"
-    assert (
-        ray_cluster_manager_instance.delete_button == mock_button.return_value
-    ), "delete_button is not set correctly"
-    assert (
-        ray_cluster_manager_instance.list_jobs_button == mock_button.return_value
-    ), "list_jobs_button is not set correctly"
+    assert ray_cluster_manager_instance.delete_button == mock_button.return_value, (
+        "delete_button is not set correctly"
+    )
+    assert ray_cluster_manager_instance.list_jobs_button == mock_button.return_value, (
+        "list_jobs_button is not set correctly"
+    )
     assert (
         ray_cluster_manager_instance.ray_dashboard_button == mock_button.return_value
     ), "ray_dashboard_button is not set correctly"
@@ -302,12 +322,12 @@ def test_ray_cluster_manager_widgets_init(mocker, capsys):
     assert (
         ray_cluster_manager_instance.raycluster_data_output == mock_output.return_value
     ), "raycluster_data_output is not set correctly"
-    assert (
-        ray_cluster_manager_instance.user_output == mock_output.return_value
-    ), "user_output is not set correctly"
-    assert (
-        ray_cluster_manager_instance.url_output == mock_output.return_value
-    ), "url_output is not set correctly"
+    assert ray_cluster_manager_instance.user_output == mock_output.return_value, (
+        "user_output is not set correctly"
+    )
+    assert ray_cluster_manager_instance.url_output == mock_output.return_value, (
+        "url_output is not set correctly"
+    )
 
     ### Test button click events
     mock_delete_button = MagicMock()
@@ -368,9 +388,9 @@ def test_ray_cluster_manager_widgets_init(mocker, capsys):
     mock_delete_cluster.assert_called_with("test-cluster-2", namespace)
 
     # Assert on deletion that the dataframe is empty
-    assert (
-        ray_cluster_manager_instance.ray_clusters_df.empty
-    ), "Expected DataFrame to be empty after deletion"
+    assert ray_cluster_manager_instance.ray_clusters_df.empty, (
+        "Expected DataFrame to be empty after deletion"
+    )
 
     captured = capsys.readouterr()
     assert (
@@ -468,12 +488,12 @@ def test_format_status():
     ]
 
     for status, expected_output in test_cases:
-        assert (
-            cf_widgets._format_status(status) == expected_output
-        ), f"Failed for status: {status}"
+        assert cf_widgets._format_status(status) == expected_output, (
+            f"Failed for status: {status}"
+        )
 
     # Test an unrecognized status
     unrecognized_status = "NotAStatus"
-    assert (
-        cf_widgets._format_status(unrecognized_status) == "NotAStatus"
-    ), "Failed for unrecognized status"
+    assert cf_widgets._format_status(unrecognized_status) == "NotAStatus", (
+        "Failed for unrecognized status"
+    )

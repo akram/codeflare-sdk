@@ -1,23 +1,26 @@
 approvers:
-  - astefanutti
-  - Bobbins228
-  - ChristianZaccaria
-  - dimakis
-  - Fiona-Waters
-  - franciscojavierarceo
-  - kpostoffice
-  - maxusmusti
-  - MichaelClifford
-  - varshaprasad96
+  - CathalOConnorRH
+  - chipspeak
+  - kryanbeane
+  - laurafitzgerald
+  - pawelpaszki
+  - pmccarthy
+  - szaher
 reviewers:
   - astefanutti
   - Bobbins228
+  - CathalOConnorRH
+  - chipspeak
   - ChristianZaccaria
+  - DavidAdaRH
   - dimakis
   - Fiona-Waters
   - franciscojavierarceo
   - kpostoffice
-  - maxusmusti
-  - MichaelClifford
+  - kryanbeane
+  - laurafitzgerald
+  - pawelpaszki
+  - pmccarthy
+  - szaher
   - varshaprasad96
   - Ygnas

@@ -13,13 +13,16 @@
 # limitations under the License.
 
 """
-    This sub-module exists primarily to be used internally by the Cluster object
-    (in the cluster sub-module) for RayCluster/AppWrapper generation.
+This sub-module exists primarily to be used internally by the Cluster object
+    (in the cluster sub-module) for RayCluster generation.
 """
-from typing import Union, Tuple, Dict
+
+from typing import List, Union, Tuple, Dict
 from ...common import _kube_api_error_handling
 from ...common.kubernetes_cluster import get_api_client, config_check
 from kubernetes.client.exceptions import ApiException
+from ...common.utils.constants import RAY_VERSION
+from ...common.utils.utils import update_image
 import codeflare_sdk
 import os
 
@@ -40,15 +43,33 @@ from kubernetes.client import (
     V1PodTemplateSpec,
     V1PodSpec,
     V1LocalObjectReference,
+    V1Toleration,
 )
 
 import yaml
 import uuid
-import sys
-import warnings
 import json
 
+
 FORBIDDEN_CUSTOM_RESOURCE_TYPES = ["GPU", "CPU", "memory"]
+
+
+def _cpu_limit_to_num_cpus(cpu_limit: Union[int, str]) -> str:
+    """Convert a Kubernetes CPU limit to an integer string for Ray's num-cpus.
+
+    Ray auto-detects host CPUs when num-cpus is not set, which can vastly
+    overcount in containerised environments (e.g. KinD on a beefy laptop).
+    Pinning num-cpus to the container CPU limit keeps the autoscaler's view
+    of available resources accurate.
+    """
+    if isinstance(cpu_limit, int):
+        return str(max(cpu_limit, 0))
+    s = str(cpu_limit).strip()
+    if s.endswith("m"):
+        return str(max(int(float(s[:-1]) / 1000), 1))
+    return str(max(int(float(s)), 1))
+
+
 VOLUME_MOUNTS = [
     V1VolumeMount(
         mount_path="/etc/pki/tls/certs/odh-trusted-ca-bundle.crt",
@@ -91,20 +112,14 @@ VOLUMES = [
     ),
 ]
 
-SUPPORTED_PYTHON_VERSIONS = {
-    "3.9": "quay.io/modh/ray@sha256:0d715f92570a2997381b7cafc0e224cfa25323f18b9545acfd23bc2b71576d06",
-    "3.11": "quay.io/modh/ray@sha256:db667df1bc437a7b0965e8031e905d3ab04b86390d764d120e05ea5a5c18d1b4",
-}
 
-
-# RayCluster/AppWrapper builder function
+# RayCluster builder function
 def build_ray_cluster(cluster: "codeflare_sdk.ray.cluster.Cluster"):
-    """build_ray_cluster is used for creating a Ray Cluster/AppWrapper dict
+    """build_ray_cluster is used for creating a Ray Cluster dict
 
     The resource is a dict template which uses Kubernetes Objects for creating metadata, resource requests,
     specs and containers. The result is sanitised and returned either as a dict or written as a yaml file.
     """
-    ray_version = "2.35.0"
 
     # GPU related variables
     head_gpu_count, worker_gpu_count = head_worker_gpu_count_from_cluster(cluster)
@@ -116,14 +131,36 @@ def build_ray_cluster(cluster: "codeflare_sdk.ray.cluster.Cluster"):
     worker_resources = json.dumps(worker_resources).replace('"', '\\"')
     worker_resources = f'"{worker_resources}"'
 
+    # Determine autoscaling vs fixed-size worker replica settings
+    autoscaling_enabled = cluster.config.enable_autoscaling
+    if autoscaling_enabled:
+        from codeflare_sdk.common.kueue.kueue import get_default_kueue_name
+
+        lq_name = cluster.config.local_queue or get_default_kueue_name(
+            cluster.config.namespace
+        )
+        if lq_name is not None:
+            raise ValueError(
+                "Autoscaling is not supported when Kueue is enabled. "
+                "Please remove the autoscaler configuration from your "
+                "ClusterConfiguration."
+            )
+        worker_replicas = cluster.config.min_workers
+        worker_min_replicas = cluster.config.min_workers
+        worker_max_replicas = cluster.config.max_workers
+    else:
+        worker_replicas = cluster.config.num_workers
+        worker_min_replicas = cluster.config.num_workers
+        worker_max_replicas = cluster.config.num_workers
+
     # Create the Ray Cluster using the V1RayCluster Object
     resource = {
         "apiVersion": "ray.io/v1",
         "kind": "RayCluster",
         "metadata": get_metadata(cluster),
         "spec": {
-            "rayVersion": ray_version,
-            "enableInTreeAutoscaling": False,
+            "rayVersion": RAY_VERSION,
+            "enableInTreeAutoscaling": autoscaling_enabled,
             "autoscalerOptions": {
                 "upscalingMode": "Default",
                 "idleTimeoutSeconds": 60,
@@ -135,39 +172,81 @@ def build_ray_cluster(cluster: "codeflare_sdk.ray.cluster.Cluster"):
                 "rayStartParams": {
                     "dashboard-host": "0.0.0.0",
                     "block": "true",
+                    "num-cpus": _cpu_limit_to_num_cpus(cluster.config.head_cpu_limits),
                     "num-gpus": str(head_gpu_count),
                     "resources": head_resources,
                 },
-                "template": {
-                    "spec": get_pod_spec(cluster, [get_head_container_spec(cluster)])
-                },
+                "template": V1PodTemplateSpec(
+                    metadata=(
+                        V1ObjectMeta(cluster.config.annotations)
+                        if cluster.config.annotations
+                        else None
+                    ),
+                    spec=get_pod_spec(
+                        cluster,
+                        [get_head_container_spec(cluster)],
+                        cluster.config.head_tolerations,
+                    ),
+                ),
             },
             "workerGroupSpecs": [
                 {
-                    "replicas": cluster.config.num_workers,
-                    "minReplicas": cluster.config.num_workers,
-                    "maxReplicas": cluster.config.num_workers,
+                    "replicas": worker_replicas,
+                    "minReplicas": worker_min_replicas,
+                    "maxReplicas": worker_max_replicas,
                     "groupName": f"small-group-{cluster.config.name}",
                     "rayStartParams": {
                         "block": "true",
+                        "num-cpus": _cpu_limit_to_num_cpus(
+                            cluster.config.worker_cpu_limits
+                        ),
                         "num-gpus": str(worker_gpu_count),
                         "resources": worker_resources,
                     },
                     "template": V1PodTemplateSpec(
-                        spec=get_pod_spec(cluster, [get_worker_container_spec(cluster)])
+                        metadata=(
+                            V1ObjectMeta(cluster.config.annotations)
+                            if cluster.config.annotations
+                            else None
+                        ),
+                        spec=get_pod_spec(
+                            cluster,
+                            [get_worker_container_spec(cluster)],
+                            cluster.config.worker_tolerations,
+                        ),
                     ),
                 }
             ],
         },
     }
 
+    if cluster.config.enable_gcs_ft:
+        if not cluster.config.redis_address:
+            raise ValueError(
+                "redis_address must be provided when enable_gcs_ft is True"
+            )
+
+        gcs_ft_options = {"redisAddress": cluster.config.redis_address}
+
+        if cluster.config.external_storage_namespace:
+            gcs_ft_options["externalStorageNamespace"] = (
+                cluster.config.external_storage_namespace
+            )
+
+        if cluster.config.redis_password_secret:
+            gcs_ft_options["redisPassword"] = {
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": cluster.config.redis_password_secret["name"],
+                        "key": cluster.config.redis_password_secret["key"],
+                    }
+                }
+            }
+
+        resource["spec"]["gcsFaultToleranceOptions"] = gcs_ft_options
+
     config_check()
     k8s_client = get_api_client() or client.ApiClient()
-
-    if cluster.config.appwrapper:
-        # Wrap the Ray Cluster in an AppWrapper
-        appwrapper_name, _ = gen_names(cluster.config.name)
-        resource = wrap_cluster(cluster, appwrapper_name, resource)
 
     resource = k8s_client.sanitize_for_serialization(resource)
 
@@ -175,14 +254,13 @@ def build_ray_cluster(cluster: "codeflare_sdk.ray.cluster.Cluster"):
     if cluster.config.write_to_file:
         return write_to_file(cluster, resource)  # Writes the file and returns its name
     else:
-        print(f"Yaml resources loaded for {cluster.config.name}")
         return resource  # Returns the Resource as a dict
 
 
 # Metadata related functions
 def get_metadata(cluster: "codeflare_sdk.ray.cluster.Cluster"):
     """
-    The get_metadata() function builds and returns a V1ObjectMeta Object using cluster configurtation parameters
+    The get_metadata() function builds and returns a V1ObjectMeta Object using cluster configuration parameters
     """
     object_meta = V1ObjectMeta(
         name=cluster.config.name,
@@ -191,9 +269,10 @@ def get_metadata(cluster: "codeflare_sdk.ray.cluster.Cluster"):
     )
 
     # Get the NB annotation if it exists - could be useful in future for a "annotations" parameter.
-    annotations = get_nb_annotations()
+    annotations = with_nb_annotations(cluster.config.annotations)
     if annotations != {}:
         object_meta.annotations = annotations  # As annotations are not a guarantee they are appended to the metadata after creation.
+
     return object_meta
 
 
@@ -203,21 +282,20 @@ def get_labels(cluster: "codeflare_sdk.ray.cluster.Cluster"):
     """
     labels = {
         "controller-tools.k8s.io": "1.0",
+        "ray.io/cluster": cluster.config.name,  # Enforced label always present
     }
     if cluster.config.labels != {}:
         labels.update(cluster.config.labels)
 
-    if cluster.config.appwrapper is False:
-        add_queue_label(cluster, labels)
+    add_queue_label(cluster, labels)
 
     return labels
 
 
-def get_nb_annotations():
+def with_nb_annotations(annotations: dict):
     """
-    The get_nb_annotations() function generates the annotation for NB Prefix if the SDK is running in a notebook
+    The with_nb_annotations() function generates the annotation for NB Prefix if the SDK is running in a notebook and appends any user set annotations
     """
-    annotations = {}
 
     # Notebook annotation
     nb_prefix = os.environ.get("NB_PREFIX")
@@ -228,30 +306,21 @@ def get_nb_annotations():
 
 
 # Head/Worker container related functions
-def update_image(image) -> str:
-    """
-    The update_image() function automatically sets the image config parameter to a preset image based on Python version if not specified.
-    If no Ray image exists for the given Python version a warning is produced.
-    """
-    if not image:
-        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-        if python_version in SUPPORTED_PYTHON_VERSIONS:
-            image = SUPPORTED_PYTHON_VERSIONS[python_version]
-        else:
-            warnings.warn(
-                f"No default Ray image defined for {python_version}. Please provide your own image or use one of the following python versions: {', '.join(SUPPORTED_PYTHON_VERSIONS.keys())}."
-            )
-    return image
-
-
-def get_pod_spec(cluster: "codeflare_sdk.ray.cluster.Cluster", containers):
+def get_pod_spec(
+    cluster: "codeflare_sdk.ray.cluster.Cluster",
+    containers: List,
+    tolerations: List[V1Toleration],
+) -> V1PodSpec:
     """
     The get_pod_spec() function generates a V1PodSpec for the head/worker containers
     """
+
     pod_spec = V1PodSpec(
         containers=containers,
-        volumes=VOLUMES,
+        volumes=generate_custom_storage(cluster.config.volumes, VOLUMES),
+        tolerations=tolerations or None,
     )
+
     if cluster.config.image_pull_secrets != []:
         pod_spec.image_pull_secrets = generate_image_pull_secrets(cluster)
 
@@ -296,7 +365,9 @@ def get_head_container_spec(
             cluster.config.head_memory_limits,
             cluster.config.head_extended_resource_requests,
         ),
-        volume_mounts=VOLUME_MOUNTS,
+        volume_mounts=generate_custom_storage(
+            cluster.config.volume_mounts, VOLUME_MOUNTS
+        ),
     )
     if cluster.config.envs != {}:
         head_container.env = generate_env_vars(cluster)
@@ -338,7 +409,9 @@ def get_worker_container_spec(
             cluster.config.worker_memory_limits,
             cluster.config.worker_extended_resource_requests,
         ),
-        volume_mounts=VOLUME_MOUNTS,
+        volume_mounts=generate_custom_storage(
+            cluster.config.volume_mounts, VOLUME_MOUNTS
+        ),
     )
 
     if cluster.config.envs != {}:
@@ -403,28 +476,18 @@ def head_worker_extended_resources_from_cluster(
         resource_type = cluster.config.extended_resource_mapping[k]
         if resource_type in FORBIDDEN_CUSTOM_RESOURCE_TYPES:
             continue
-        head_worker_extended_resources[0][
-            resource_type
-        ] = cluster.config.head_extended_resource_requests[
-            k
-        ] + head_worker_extended_resources[
-            0
-        ].get(
-            resource_type, 0
+        head_worker_extended_resources[0][resource_type] = (
+            cluster.config.head_extended_resource_requests[k]
+            + head_worker_extended_resources[0].get(resource_type, 0)
         )
 
     for k in cluster.config.worker_extended_resource_requests.keys():
         resource_type = cluster.config.extended_resource_mapping[k]
         if resource_type in FORBIDDEN_CUSTOM_RESOURCE_TYPES:
             continue
-        head_worker_extended_resources[1][
-            resource_type
-        ] = cluster.config.worker_extended_resource_requests[
-            k
-        ] + head_worker_extended_resources[
-            1
-        ].get(
-            resource_type, 0
+        head_worker_extended_resources[1][resource_type] = (
+            cluster.config.worker_extended_resource_requests[k]
+            + head_worker_extended_resources[1].get(resource_type, 0)
         )
     return head_worker_extended_resources
 
@@ -435,12 +498,14 @@ def add_queue_label(cluster: "codeflare_sdk.ray.cluster.Cluster", labels: dict):
     The add_queue_label() function updates the given base labels with the local queue label if Kueue exists on the Cluster
     """
     lq_name = cluster.config.local_queue or get_default_local_queue(cluster, labels)
-    if lq_name == None:
+    if lq_name is None:
         return
     elif not local_queue_exists(cluster):
-        raise ValueError(
+        # ValueError removed to pass validation to validating admission policy
+        print(
             "local_queue provided does not exist or is not in this namespace. Please provide the correct local_queue name in Cluster Configuration"
         )
+        return
     labels.update({"kueue.x-k8s.io/queue-name": lq_name})
 
 
@@ -497,34 +562,26 @@ def get_default_local_queue(cluster: "codeflare_sdk.ray.cluster.Cluster", labels
             labels.update({"kueue.x-k8s.io/queue-name": lq["metadata"]["name"]})
 
 
-# AppWrapper related functions
-def wrap_cluster(
-    cluster: "codeflare_sdk.ray.cluster.Cluster",
-    appwrapper_name: str,
-    ray_cluster_yaml: dict,
-):
-    """
-    Wraps the pre-built Ray Cluster dict in an AppWrapper
-    """
-    wrapping = {
-        "apiVersion": "workload.codeflare.dev/v1beta2",
-        "kind": "AppWrapper",
-        "metadata": {"name": appwrapper_name, "namespace": cluster.config.namespace},
-        "spec": {"components": [{"template": ray_cluster_yaml}]},
-    }
-    # Add local queue label if it is necessary
-    labels = {}
-    add_queue_label(cluster, labels)
-    if labels != {}:
-        wrapping["metadata"]["labels"] = labels
-
-    return wrapping
-
-
 # Etc.
+def generate_custom_storage(provided_storage: list, default_storage: list):
+    """
+    The generate_custom_storage function updates the volumes/volume mounts configs with the default volumes/volume mounts.
+    """
+    storage_list = provided_storage.copy()
+
+    if storage_list == []:
+        storage_list = default_storage
+    else:
+        # We append the list of volumes/volume mounts with the defaults and return the full list
+        for storage in default_storage:
+            storage_list.append(storage)
+
+    return storage_list
+
+
 def write_to_file(cluster: "codeflare_sdk.ray.cluster.Cluster", resource: dict):
     """
-    The write_to_file function writes the built Ray Cluster/AppWrapper dict as a yaml file in the .codeflare folder
+    The write_to_file function writes the built Ray Cluster dict as a yaml file in the .codeflare folder
     """
     directory_path = os.path.expanduser("~/.codeflare/resources/")
     output_file_name = os.path.join(directory_path, cluster.config.name + ".yaml")
@@ -533,8 +590,20 @@ def write_to_file(cluster: "codeflare_sdk.ray.cluster.Cluster", resource: dict):
     if not os.path.exists(directory_path):
         os.makedirs(directory_path)
 
+    # Convert resource to JSON and back to sanitize Pydantic undefined values
+    # This is a workaround for PyYAML not being able to serialize Pydantic v2 models
+    # used by Kubernetes client v33+
+    try:
+        import json
+
+        resource_json = json.dumps(resource, default=str)
+        sanitized_resource = json.loads(resource_json)
+    except (TypeError, ValueError):
+        # If JSON serialization fails, use the resource as-is
+        sanitized_resource = resource
+
     with open(output_file_name, "w") as outfile:
-        yaml.dump(resource, outfile, default_flow_style=False)
+        yaml.dump(sanitized_resource, outfile, default_flow_style=False)
 
     print(f"Written to: {output_file_name}")
     return output_file_name
@@ -542,12 +611,11 @@ def write_to_file(cluster: "codeflare_sdk.ray.cluster.Cluster", resource: dict):
 
 def gen_names(name):
     """
-    Generates a unique name for the appwrapper and Ray Cluster
+    Generates a unique name for the Ray Cluster
     """
     if not name:
         gen_id = str(uuid.uuid4())
-        appwrapper_name = "appwrapper-" + gen_id
         cluster_name = "cluster-" + gen_id
-        return appwrapper_name, cluster_name
+        return cluster_name
     else:
-        return name, name
+        return name

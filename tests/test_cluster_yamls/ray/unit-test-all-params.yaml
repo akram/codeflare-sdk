@@ -3,11 +3,14 @@ kind: RayCluster
 metadata:
   annotations:
     app.kubernetes.io/managed-by: test-prefix
+    key1: value1
+    key2: value2
   labels:
     controller-tools.k8s.io: '1.0'
     key1: value1
     key2: value2
     kueue.x-k8s.io/queue-name: local-queue-default
+    ray.io/cluster: test-all-params
   name: test-all-params
   namespace: ns
 spec:
@@ -27,10 +30,16 @@ spec:
     rayStartParams:
       block: 'true'
       dashboard-host: 0.0.0.0
+      num-cpus: '8'
       num-gpus: '1'
       resources: '"{\"TPU\": 2}"'
     serviceType: ClusterIP
     template:
+      metadata:
+        annotations:
+          app.kubernetes.io/managed-by: test-prefix
+          key1: value1
+          key2: value2
       spec:
         containers:
         - env:
@@ -38,6 +47,8 @@ spec:
             value: value1
           - name: key2
             value: value2
+          - name: RAY_USAGE_STATS_ENABLED
+            value: '0'
           image: example/ray:tag
           imagePullPolicy: Always
           lifecycle:
@@ -67,6 +78,12 @@ spec:
               memory: 12G
               nvidia.com/gpu: 1
           volumeMounts:
+          - mountPath: /home/ray/test1
+            name: test
+          - mountPath: /home/ray/test2
+            name: test2
+          - mountPath: /home/ray/test2
+            name: test3
           - mountPath: /etc/pki/tls/certs/odh-trusted-ca-bundle.crt
             name: odh-trusted-ca-cert
             subPath: odh-trusted-ca-bundle.crt
@@ -82,7 +99,24 @@ spec:
         imagePullSecrets:
         - name: secret1
         - name: secret2
+        tolerations:
+        - effect: NoSchedule
+          key: key1
+          operator: Equal
+          value: value1
         volumes:
+        - emptyDir:
+            sizeLimit: 500Gi
+          name: test
+        - configMap:
+            items:
+            - key: test
+              path: /home/ray/test2/data.txt
+            name: config-map-test
+          name: test2
+        - name: test3
+          secret:
+            secretName: test-secret
         - configMap:
             items:
             - key: ca-bundle.crt
@@ -97,17 +131,23 @@ spec:
             name: odh-trusted-ca-bundle
             optional: true
           name: odh-ca-cert
-  rayVersion: 2.35.0
+  rayVersion: ${ray_version}
   workerGroupSpecs:
   - groupName: small-group-test-all-params
     maxReplicas: 10
     minReplicas: 10
     rayStartParams:
       block: 'true'
+      num-cpus: '8'
       num-gpus: '1'
       resources: '"{}"'
     replicas: 10
     template:
+      metadata:
+        annotations:
+          app.kubernetes.io/managed-by: test-prefix
+          key1: value1
+          key2: value2
       spec:
         containers:
         - env:
@@ -115,6 +155,8 @@ spec:
             value: value1
           - name: key2
             value: value2
+          - name: RAY_USAGE_STATS_ENABLED
+            value: '0'
           image: example/ray:tag
           imagePullPolicy: Always
           lifecycle:
@@ -135,6 +177,12 @@ spec:
               memory: 12G
               nvidia.com/gpu: 1
           volumeMounts:
+          - mountPath: /home/ray/test1
+            name: test
+          - mountPath: /home/ray/test2
+            name: test2
+          - mountPath: /home/ray/test2
+            name: test3
           - mountPath: /etc/pki/tls/certs/odh-trusted-ca-bundle.crt
             name: odh-trusted-ca-cert
             subPath: odh-trusted-ca-bundle.crt
@@ -150,7 +198,24 @@ spec:
         imagePullSecrets:
         - name: secret1
         - name: secret2
+        tolerations:
+        - effect: NoSchedule
+          key: key2
+          operator: Equal
+          value: value2
         volumes:
+        - emptyDir:
+            sizeLimit: 500Gi
+          name: test
+        - configMap:
+            items:
+            - key: test
+              path: /home/ray/test2/data.txt
+            name: config-map-test
+          name: test2
+        - name: test3
+          secret:
+            secretName: test-secret
         - configMap:
             items:
             - key: ca-bundle.crt

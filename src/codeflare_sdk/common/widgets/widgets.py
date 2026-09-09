@@ -15,6 +15,7 @@
 """
 The widgets sub-module contains the ui widgets created using the ipywidgets package.
 """
+
 import contextlib
 import io
 import os
@@ -26,6 +27,8 @@ from kubernetes.client.rest import ApiException
 import ipywidgets as widgets
 from IPython.display import display, HTML, Javascript
 import pandas as pd
+
+from ...common.utils import get_current_namespace
 from ...ray.cluster.config import ClusterConfiguration
 from ...ray.cluster.status import RayClusterStatus
 from ..kubernetes_cluster import _kube_api_error_handling
@@ -43,8 +46,6 @@ class RayClusterManagerWidgets:
     """
 
     def __init__(self, ray_clusters_df: pd.DataFrame, namespace: str = None):
-        from ...ray.cluster.cluster import get_current_namespace
-
         # Data
         self.ray_clusters_df = ray_clusters_df
         self.namespace = get_current_namespace() if not namespace else namespace
@@ -148,9 +149,11 @@ class RayClusterManagerWidgets:
         cluster_name = self.classification_widget.value
 
         # Suppress from Cluster Object initialisation widgets and outputs
-        with widgets.Output(), contextlib.redirect_stdout(
-            io.StringIO()
-        ), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            widgets.Output(),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             cluster = Cluster(ClusterConfiguration(cluster_name, self.namespace))
         dashboard_url = cluster.cluster_dashboard_uri()
 
@@ -171,9 +174,11 @@ class RayClusterManagerWidgets:
         cluster_name = self.classification_widget.value
 
         # Suppress from Cluster Object initialisation widgets and outputs
-        with widgets.Output(), contextlib.redirect_stdout(
-            io.StringIO()
-        ), contextlib.redirect_stderr(io.StringIO()):
+        with (
+            widgets.Output(),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
             cluster = Cluster(ClusterConfiguration(cluster_name, self.namespace))
         dashboard_url = cluster.cluster_dashboard_uri()
 
@@ -271,26 +276,21 @@ class RayClusterManagerWidgets:
         )
 
 
-def cluster_up_down_buttons(
+def cluster_apply_down_buttons(
     cluster: "codeflare_sdk.ray.cluster.cluster.Cluster",
 ) -> widgets.Button:
     """
-    The cluster_up_down_buttons function returns two button widgets for a create and delete button.
-    The function uses the appwrapper bool to distinguish between resource type for the tool tip.
+    The cluster_apply_down_buttons function returns two button widgets for a create and delete button.
     """
-    resource = "Ray Cluster"
-    if cluster.config.appwrapper:
-        resource = "AppWrapper"
-
-    up_button = widgets.Button(
-        description="Cluster Up",
-        tooltip=f"Create the {resource}",
+    apply_button = widgets.Button(
+        description="Cluster Apply",
+        tooltip="Create the Ray Cluster",
         icon="play",
     )
 
     delete_button = widgets.Button(
         description="Cluster Down",
-        tooltip=f"Delete the {resource}",
+        tooltip="Delete the Ray Cluster",
         icon="trash",
     )
 
@@ -298,24 +298,34 @@ def cluster_up_down_buttons(
     output = widgets.Output()
 
     # Display the buttons in an HBox wrapped in a VBox which includes the wait_ready Checkbox
-    button_display = widgets.HBox([up_button, delete_button])
+    button_display = widgets.HBox([apply_button, delete_button])
     display(widgets.VBox([button_display, wait_ready_check]), output)
 
-    def on_up_button_clicked(b):  # Handle the up button click event
+    def on_apply_button_clicked(b):  # Handle the apply button click event
         with output:
             output.clear_output()
-            cluster.up()
+            try:
+                # Use shorter TLS timeout (60s) for widget button clicks to avoid blocking UI
+                # Users who need full TLS wait can use wait_ready() checkbox or call apply() directly
+                cluster.apply(timeout=60)
 
-            # If the wait_ready Checkbox is clicked(value == True) trigger the wait_ready function
-            if wait_ready_check.value:
-                cluster.wait_ready()
+                # If the wait_ready Checkbox is clicked(value == True) trigger the wait_ready function
+                if wait_ready_check.value:
+                    cluster.wait_ready()
+            except RuntimeError as e:
+                # Fix for RHOAIENG-54733: display error instead of silently swallowing it
+                print(f"Error applying cluster: {e}")
 
     def on_down_button_clicked(b):  # Handle the down button click event
         with output:
             output.clear_output()
-            cluster.down()
+            try:
+                cluster.down()
+            except RuntimeError as e:
+                # Fix for RHOAIENG-54733: display error instead of silently swallowing it
+                print(f"Error deleting cluster: {e}")
 
-    up_button.on_click(on_up_button_clicked)
+    apply_button.on_click(on_apply_button_clicked)
     delete_button.on_click(on_down_button_clicked)
 
 
@@ -332,15 +342,34 @@ def _wait_ready_check_box():
 
 def is_notebook() -> bool:
     """
-    The is_notebook function checks if Jupyter Notebook environment variables exist in the given environment and return True/False based on that.
+    The is_notebook function checks if we're running in a Jupyter Notebook environment.
+
+    Detection methods:
+    1. Check for IPython's ZMQInteractiveShell (standard Jupyter kernel)
+    2. Check for known environment variables (VSCode, RHOAI/ODH)
     """
+    # First, try the standard IPython detection method
+    try:
+        from IPython import get_ipython
+
+        shell = get_ipython()
+        if shell is not None:
+            shell_class = shell.__class__.__name__
+            # ZMQInteractiveShell = Jupyter notebook/lab, qtconsole
+            if shell_class == "ZMQInteractiveShell":
+                return True
+    except (ImportError, NameError):
+        pass
+
+    # Fallback: check for known environment variables
     if (
         "PYDEVD_IPYTHON_COMPATIBLE_DEBUGGING" in os.environ
         or "JPY_SESSION_NAME" in os.environ
-    ):  # If running Jupyter NBs in VsCode or RHOAI/ODH display UI buttons
+        or "JPY_PARENT_PID" in os.environ  # Standard Jupyter
+    ):
         return True
-    else:
-        return False
+
+    return False
 
 
 def view_clusters(namespace: str = None):
@@ -352,8 +381,6 @@ def view_clusters(namespace: str = None):
             "view_clusters can only be used in a Jupyter Notebook environment."
         )
         return  # Exit function if not in Jupyter Notebook
-
-    from ...ray.cluster.cluster import get_current_namespace
 
     if not namespace:
         namespace = get_current_namespace()
@@ -382,43 +409,26 @@ def _delete_cluster(
     _delete_cluster function deletes the cluster with the given name and namespace.
     It optionally waits for the cluster to be deleted.
     """
-    from ...ray.cluster.cluster import _check_aw_exists
-
     try:
         config_check()
         api_instance = client.CustomObjectsApi(get_api_client())
 
-        if _check_aw_exists(cluster_name, namespace):
-            api_instance.delete_namespaced_custom_object(
-                group="workload.codeflare.dev",
-                version="v1beta2",
-                namespace=namespace,
-                plural="appwrappers",
-                name=cluster_name,
-            )
-            group = "workload.codeflare.dev"
-            version = "v1beta2"
-            plural = "appwrappers"
-        else:
-            api_instance.delete_namespaced_custom_object(
-                group="ray.io",
-                version="v1",
-                namespace=namespace,
-                plural="rayclusters",
-                name=cluster_name,
-            )
-            group = "ray.io"
-            version = "v1"
-            plural = "rayclusters"
+        api_instance.delete_namespaced_custom_object(
+            group="ray.io",
+            version="v1",
+            namespace=namespace,
+            plural="rayclusters",
+            name=cluster_name,
+        )
 
         # Wait for the resource to be deleted
         while timeout > 0:
             try:
                 api_instance.get_namespaced_custom_object(
-                    group=group,
-                    version=version,
+                    group="ray.io",
+                    version="v1",
                     namespace=namespace,
-                    plural=plural,
+                    plural="rayclusters",
                     name=cluster_name,
                 )
                 # Retry if resource still exists

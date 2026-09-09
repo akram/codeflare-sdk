@@ -3,6 +3,7 @@ kind: RayCluster
 metadata:
   labels:
     controller-tools.k8s.io: '1.0'
+    ray.io/cluster: default-cluster
   name: default-cluster
   namespace: ns
 spec:
@@ -22,13 +23,14 @@ spec:
     rayStartParams:
       block: 'true'
       dashboard-host: 0.0.0.0
+      num-cpus: '2'
       num-gpus: '0'
       resources: '"{}"'
     serviceType: ClusterIP
     template:
       spec:
         containers:
-        - image: quay.io/modh/ray@sha256:0d715f92570a2997381b7cafc0e224cfa25323f18b9545acfd23bc2b71576d06
+        - image: "${image}"
           imagePullPolicy: Always
           lifecycle:
             preStop:
@@ -45,13 +47,16 @@ spec:
             name: dashboard
           - containerPort: 10001
             name: client
+          env:
+          - name: RAY_USAGE_STATS_ENABLED
+            value: '0'
           resources:
             limits:
               cpu: 2
               memory: 8G
             requests:
-              cpu: 2
-              memory: 8G
+              cpu: 1
+              memory: 5G
           volumeMounts:
           - mountPath: /etc/pki/tls/certs/odh-trusted-ca-bundle.crt
             name: odh-trusted-ca-cert
@@ -80,20 +85,21 @@ spec:
             name: odh-trusted-ca-bundle
             optional: true
           name: odh-ca-cert
-  rayVersion: 2.35.0
+  rayVersion: ${ray_version}
   workerGroupSpecs:
   - groupName: small-group-default-cluster
     maxReplicas: 1
     minReplicas: 1
     rayStartParams:
       block: 'true'
+      num-cpus: '1'
       num-gpus: '0'
       resources: '"{}"'
     replicas: 1
     template:
       spec:
         containers:
-        - image: quay.io/modh/ray@sha256:0d715f92570a2997381b7cafc0e224cfa25323f18b9545acfd23bc2b71576d06
+        - image: "${image}"
           imagePullPolicy: Always
           lifecycle:
             preStop:
@@ -106,10 +112,13 @@ spec:
           resources:
             limits:
               cpu: 1
-              memory: 2G
+              memory: 6G
             requests:
               cpu: 1
-              memory: 2G
+              memory: 3G
+          env:
+          - name: RAY_USAGE_STATS_ENABLED
+            value: '0'
           volumeMounts:
           - mountPath: /etc/pki/tls/certs/odh-trusted-ca-bundle.crt
             name: odh-trusted-ca-cert

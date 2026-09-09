@@ -19,9 +19,11 @@ Cluster object.
 """
 
 import pathlib
+import re
 import warnings
 from dataclasses import dataclass, field, fields
 from typing import Dict, List, Optional, Union, get_args, get_origin
+from kubernetes.client import V1Toleration, V1Volume, V1VolumeMount
 
 dir = pathlib.Path(__file__).parent.parent.resolve()
 
@@ -37,6 +39,20 @@ DEFAULT_RESOURCE_MAPPING = {
     "huawei.com/Ascend310": "NPU",
 }
 
+# Kubernetes metadata.name must be a lowercase RFC 1123 subdomain
+_RFC1123_SUBDOMAIN = re.compile(
+    r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+)
+
+
+def _validate_cluster_name(name: str):
+    """Raise ValueError if name is not a valid Kubernetes metadata.name (RFC 1123 subdomain)."""
+    if not name or not _RFC1123_SUBDOMAIN.match(name):
+        raise ValueError(
+            "Cluster name must be a valid RFC 1123 subdomain "
+            "(lowercase, numbers, hyphens/dots; start and end with letter or number)."
+        )
+
 
 @dataclass
 class ClusterConfiguration:
@@ -49,28 +65,14 @@ class ClusterConfiguration:
             The name of the cluster.
         namespace:
             The namespace in which the cluster should be created.
-        head_cpus:
-            The number of CPUs to allocate to the head node.
-        head_memory:
-            The amount of memory to allocate to the head node.
-        head_gpus:
-            The number of GPUs to allocate to the head node. (Deprecated, use head_extended_resource_requests)
         head_extended_resource_requests:
             A dictionary of extended resource requests for the head node. ex: {"nvidia.com/gpu": 1}
-        min_cpus:
-            The minimum number of CPUs to allocate to each worker.
-        max_cpus:
-            The maximum number of CPUs to allocate to each worker.
+        head_tolerations:
+            List of tolerations for head nodes.
         num_workers:
             The number of workers to create.
-        min_memory:
-            The minimum amount of memory to allocate to each worker.
-        max_memory:
-            The maximum amount of memory to allocate to each worker.
-        num_gpus:
-            The number of GPUs to allocate to each worker. (Deprecated, use worker_extended_resource_requests)
-        appwrapper:
-            A boolean indicating whether to use an AppWrapper.
+        worker_tolerations:
+            List of tolerations for worker nodes.
         envs:
             A dictionary of environment variables to set for the cluster.
         image:
@@ -89,31 +91,51 @@ class ClusterConfiguration:
             A dictionary of custom resource mappings to map extended resource requests to RayCluster resource names
         overwrite_default_resource_mapping:
             A boolean indicating whether to overwrite the default resource mapping.
+        annotations:
+            A dictionary of annotations to apply to the cluster.
+        volumes:
+            A list of V1Volume objects to add to the Cluster
+        volume_mounts:
+            A list of V1VolumeMount objects to add to the Cluster
+        enable_autoscaling:
+            A boolean indicating whether to enable Ray in-tree autoscaling. When True,
+            min_workers and max_workers must also be set. Cannot be used with Kueue
+            (local_queue) until upstream KEP-77 graduates.
+        min_workers:
+            Minimum number of workers when autoscaling is enabled. Maps to
+            workerGroupSpecs.replicas and workerGroupSpecs.minReplicas.
+            Required when enable_autoscaling is True.
+        max_workers:
+            Maximum number of workers when autoscaling is enabled. Maps to
+            workerGroupSpecs.maxReplicas. Required when enable_autoscaling is True.
+        enable_gcs_ft:
+            A boolean indicating whether to enable GCS fault tolerance.
+        enable_usage_stats:
+            A boolean indicating whether to capture and send Ray usage stats externally.
+        redis_address:
+            The address of the Redis server to use for GCS fault tolerance, required when enable_gcs_ft is True.
+        redis_password_secret:
+            Kubernetes secret reference containing Redis password. ex: {"name": "secret-name", "key": "password-key"}
+        external_storage_namespace:
+            The storage namespace to use for GCS fault tolerance. By default, KubeRay sets it to the UID of RayCluster.
     """
 
     name: str
     namespace: Optional[str] = None
-    head_cpu_requests: Union[int, str] = 2
+    head_cpu_requests: Union[int, str] = 1
     head_cpu_limits: Union[int, str] = 2
-    head_cpus: Optional[Union[int, str]] = None  # Deprecating
-    head_memory_requests: Union[int, str] = 8
+    head_memory_requests: Union[int, str] = 5
     head_memory_limits: Union[int, str] = 8
-    head_memory: Optional[Union[int, str]] = None  # Deprecating
-    head_gpus: Optional[int] = None  # Deprecating
     head_extended_resource_requests: Dict[str, Union[str, int]] = field(
         default_factory=dict
     )
+    head_tolerations: Optional[List[V1Toleration]] = None
     worker_cpu_requests: Union[int, str] = 1
     worker_cpu_limits: Union[int, str] = 1
-    min_cpus: Optional[Union[int, str]] = None  # Deprecating
-    max_cpus: Optional[Union[int, str]] = None  # Deprecating
     num_workers: int = 1
-    worker_memory_requests: Union[int, str] = 2
-    worker_memory_limits: Union[int, str] = 2
-    min_memory: Optional[Union[int, str]] = None  # Deprecating
-    max_memory: Optional[Union[int, str]] = None  # Deprecating
-    num_gpus: Optional[int] = None  # Deprecating
-    appwrapper: bool = False
+    worker_memory_requests: Union[int, str] = 3
+    worker_memory_limits: Union[int, str] = 6
+    worker_tolerations: Optional[List[V1Toleration]] = None
     envs: Dict[str, str] = field(default_factory=dict)
     image: str = ""
     image_pull_secrets: List[str] = field(default_factory=list)
@@ -126,6 +148,17 @@ class ClusterConfiguration:
     extended_resource_mapping: Dict[str, str] = field(default_factory=dict)
     overwrite_default_resource_mapping: bool = False
     local_queue: Optional[str] = None
+    enable_autoscaling: bool = False
+    min_workers: Optional[int] = None
+    max_workers: Optional[int] = None
+    annotations: Dict[str, str] = field(default_factory=dict)
+    volumes: list[V1Volume] = field(default_factory=list)
+    volume_mounts: list[V1VolumeMount] = field(default_factory=list)
+    enable_gcs_ft: bool = False
+    enable_usage_stats: bool = False
+    redis_address: Optional[str] = None
+    redis_password_secret: Optional[Dict[str, str]] = None
+    external_storage_namespace: Optional[str] = None
 
     def __post_init__(self):
         if not self.verify_tls:
@@ -133,17 +166,43 @@ class ClusterConfiguration:
                 "Warning: TLS verification has been disabled - Endpoint checks will be bypassed"
             )
 
+        self._validate_autoscaling()
+
+        if self.enable_usage_stats:
+            self.envs["RAY_USAGE_STATS_ENABLED"] = "1"
+        else:
+            self.envs["RAY_USAGE_STATS_ENABLED"] = "0"
+
+        if self.enable_gcs_ft:
+            if not self.redis_address:
+                raise ValueError(
+                    "redis_address must be provided when enable_gcs_ft is True"
+                )
+
+            if self.redis_password_secret and not isinstance(
+                self.redis_password_secret, dict
+            ):
+                raise ValueError(
+                    "redis_password_secret must be a dictionary with 'name' and 'key' fields"
+                )
+
+            if self.redis_password_secret and (
+                "name" not in self.redis_password_secret
+                or "key" not in self.redis_password_secret
+            ):
+                raise ValueError(
+                    "redis_password_secret must contain both 'name' and 'key' fields"
+                )
+
         self._validate_types()
-        self._memory_to_resource()
         self._memory_to_string()
         self._str_mem_no_unit_add_GB()
-        self._cpu_to_resource()
-        self._gpu_to_resource()
         self._combine_extended_resource_mapping()
         self._validate_extended_resource_requests(self.head_extended_resource_requests)
         self._validate_extended_resource_requests(
             self.worker_extended_resource_requests
         )
+        _validate_cluster_name(self.name)
 
     def _combine_extended_resource_mapping(self):
         if overwritten := set(self.extended_resource_mapping.keys()).intersection(
@@ -170,29 +229,24 @@ class ClusterConfiguration:
                     f"extended resource '{k}' not found in extended_resource_mapping, available resources are {list(self.extended_resource_mapping.keys())}, to add more supported resources use extended_resource_mapping. i.e. extended_resource_mapping = {{'{k}': 'FOO_BAR'}}"
                 )
 
-    def _gpu_to_resource(self):
-        if self.head_gpus:
-            warnings.warn(
-                f"head_gpus is being deprecated, replacing with head_extended_resource_requests['nvidia.com/gpu'] = {self.head_gpus}"
-            )
-            if "nvidia.com/gpu" in self.head_extended_resource_requests:
+    def _validate_autoscaling(self):
+        if self.enable_autoscaling:
+            if self.min_workers is None or self.max_workers is None:
                 raise ValueError(
-                    "nvidia.com/gpu already exists in head_extended_resource_requests"
+                    "min_workers and max_workers must be provided when enable_autoscaling is True"
                 )
-            self.head_extended_resource_requests["nvidia.com/gpu"] = self.head_gpus
-        if self.num_gpus:
-            warnings.warn(
-                f"num_gpus is being deprecated, replacing with worker_extended_resource_requests['nvidia.com/gpu'] = {self.num_gpus}"
-            )
-            if "nvidia.com/gpu" in self.worker_extended_resource_requests:
-                raise ValueError(
-                    "nvidia.com/gpu already exists in worker_extended_resource_requests"
+            if self.min_workers < 0:
+                raise ValueError("min_workers must be >= 0")
+            if self.max_workers < self.min_workers:
+                raise ValueError("max_workers must be >= min_workers")
+        else:
+            if self.min_workers is not None or self.max_workers is not None:
+                warnings.warn(
+                    "min_workers and max_workers are ignored when enable_autoscaling is False",
+                    UserWarning,
                 )
-            self.worker_extended_resource_requests["nvidia.com/gpu"] = self.num_gpus
 
     def _str_mem_no_unit_add_GB(self):
-        if isinstance(self.head_memory, str) and self.head_memory.isdecimal():
-            self.head_memory = f"{self.head_memory}G"
         if (
             isinstance(self.worker_memory_requests, str)
             and self.worker_memory_requests.isdecimal()
@@ -213,32 +267,6 @@ class ClusterConfiguration:
             self.worker_memory_requests = f"{self.worker_memory_requests}G"
         if isinstance(self.worker_memory_limits, int):
             self.worker_memory_limits = f"{self.worker_memory_limits}G"
-
-    def _cpu_to_resource(self):
-        if self.head_cpus:
-            warnings.warn(
-                "head_cpus is being deprecated, use head_cpu_requests and head_cpu_limits"
-            )
-            self.head_cpu_requests = self.head_cpu_limits = self.head_cpus
-        if self.min_cpus:
-            warnings.warn("min_cpus is being deprecated, use worker_cpu_requests")
-            self.worker_cpu_requests = self.min_cpus
-        if self.max_cpus:
-            warnings.warn("max_cpus is being deprecated, use worker_cpu_limits")
-            self.worker_cpu_limits = self.max_cpus
-
-    def _memory_to_resource(self):
-        if self.head_memory:
-            warnings.warn(
-                "head_memory is being deprecated, use head_memory_requests and head_memory_limits"
-            )
-            self.head_memory_requests = self.head_memory_limits = self.head_memory
-        if self.min_memory:
-            warnings.warn("min_memory is being deprecated, use worker_memory_requests")
-            self.worker_memory_requests = f"{self.min_memory}G"
-        if self.max_memory:
-            warnings.warn("max_memory is being deprecated, use worker_memory_limits")
-            self.worker_memory_limits = f"{self.max_memory}G"
 
     def _validate_types(self):
         """Validate the types of all fields in the ClusterConfiguration dataclass."""
@@ -262,12 +290,18 @@ class ClusterConfiguration:
             if origin_type is Union:
                 return any(check_type(value, union_type) for union_type in args)
             if origin_type is list:
-                return all(check_type(elem, args[0]) for elem in value)
+                if value is not None:
+                    return all(check_type(elem, args[0]) for elem in (value or []))
+                else:
+                    return True
             if origin_type is dict:
-                return all(
-                    check_type(k, args[0]) and check_type(v, args[1])
-                    for k, v in value.items()
-                )
+                if value is not None:
+                    return all(
+                        check_type(k, args[0]) and check_type(v, args[1])
+                        for k, v in value.items()
+                    )
+                else:
+                    return True
             if origin_type is tuple:
                 return all(check_type(elem, etype) for elem, etype in zip(value, args))
             if expected_type is int:

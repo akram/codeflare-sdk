@@ -1,5 +1,4 @@
 from time import sleep
-import time
 from codeflare_sdk import (
     Cluster,
     ClusterConfiguration,
@@ -63,12 +62,12 @@ class TestHeterogeneousClustersKind:
                     local_queue=queue_name,
                 )
             )
-            cluster.up()
+            cluster.apply()
             sleep(5)
             node_name = get_pod_node(self, self.namespace, cluster_name)
             print(f"Cluster {cluster_name}-{flavor} is running on node: {node_name}")
             sleep(5)
-            assert (
-                node_name in expected_nodes
-            ), f"Node {node_name} is not in the expected nodes for flavor {flavor}."
+            assert node_name in expected_nodes, (
+                f"Node {node_name} is not in the expected nodes for flavor {flavor}."
+            )
             cluster.down()

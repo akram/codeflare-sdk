@@ -3,17 +3,133 @@ import os
 import random
 import string
 import subprocess
+import time
+import warnings
+from time import sleep
+
 from codeflare_sdk import get_cluster
 from kubernetes import client, config
-import kubernetes.client
+from kubernetes.client import V1Toleration
 from codeflare_sdk.common.kubernetes_cluster.kube_api_helpers import (
     _kube_api_error_handling,
 )
+from codeflare_sdk.common.utils import constants
+from codeflare_sdk.common.utils.utils import get_ray_image_for_python_version
+
+# Authentication imports - prioritize kube-authkit
+try:
+    from kube_authkit import get_k8s_client, AuthConfig
+    from codeflare_sdk import set_api_client
+
+    KUBE_AUTHKIT_AVAILABLE = True
+except ImportError:
+    KUBE_AUTHKIT_AVAILABLE = False
+    get_k8s_client = None
+    AuthConfig = None
+    set_api_client = None
+
+# Fallback to legacy authentication if kube-authkit is not available
+try:
+    from codeflare_sdk import TokenAuthentication
+
+    LEGACY_AUTH_AVAILABLE = True
+except ImportError:
+    LEGACY_AUTH_AVAILABLE = False
+    TokenAuthentication = None
+
+
+def get_ray_cluster(cluster_name, namespace):
+    api = client.CustomObjectsApi()
+    try:
+        return api.get_namespaced_custom_object(
+            group="ray.io",
+            version="v1",
+            namespace=namespace,
+            plural="rayclusters",
+            name=cluster_name,
+        )
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def is_openshift():
+    """Detect if running on OpenShift by checking for OpenShift-specific API resources."""
+    try:
+        api = client.ApiClient()
+        discovery = client.ApisApi(api)
+        # Check for OpenShift-specific API group
+        groups = discovery.get_api_versions().groups
+        for group in groups:
+            if group.name == "image.openshift.io":
+                return True
+        return False
+    except Exception:
+        # If we can't determine, assume it's not OpenShift
+        return False
 
 
 def get_ray_image():
-    default_ray_image = "quay.io/modh/ray@sha256:0d715f92570a2997381b7cafc0e224cfa25323f18b9545acfd23bc2b71576d06"
-    return os.getenv("RAY_IMAGE", default_ray_image)
+    """
+    Get appropriate Ray image based on platform (OpenShift vs Kind/vanilla K8s).
+
+    The tests marked with @pytest.mark.openshift can run on both OpenShift and Kind clusters
+    with Kueue installed. This function automatically selects the appropriate image:
+    - OpenShift: Uses the CUDA runtime image (quay.io/modh/ray:...)
+    - Kind/K8s: Uses the standard Ray image (rayproject/ray:VERSION)
+
+    You can override this behavior by setting the RAY_IMAGE environment variable.
+    """
+    # Allow explicit override via environment variable
+    if "RAY_IMAGE" in os.environ:
+        return os.environ["RAY_IMAGE"]
+
+    # Auto-detect platform and return appropriate image
+    if is_openshift():
+        return get_ray_image_for_python_version()
+    else:
+        # Use standard Ray image for Kind/vanilla K8s
+        return f"rayproject/ray:{constants.RAY_VERSION}"
+
+
+def get_platform_appropriate_resources():
+    """
+    Get appropriate resource configurations based on platform.
+
+    OpenShift with MODH images requires more memory than Kind with standard Ray images.
+
+    Returns:
+        dict: Resource configurations with keys:
+            - head_cpu_requests, head_cpu_limits
+            - head_memory_requests, head_memory_limits
+            - worker_cpu_requests, worker_cpu_limits
+            - worker_memory_requests, worker_memory_limits
+    """
+    if is_openshift():
+        # MODH runtime images require more memory
+        return {
+            "head_cpu_requests": "1",
+            "head_cpu_limits": "1.5",
+            "head_memory_requests": 7,
+            "head_memory_limits": 8,
+            "worker_cpu_requests": "1",
+            "worker_cpu_limits": "1",
+            "worker_memory_requests": 5,
+            "worker_memory_limits": 6,
+        }
+    else:
+        # Standard Ray images require less memory
+        return {
+            "head_cpu_requests": "1",
+            "head_cpu_limits": "1.5",
+            "head_memory_requests": 7,
+            "head_memory_limits": 8,
+            "worker_cpu_requests": "1",
+            "worker_cpu_limits": "1",
+            "worker_memory_requests": 2,
+            "worker_memory_limits": 3,
+        }
 
 
 def get_setup_env_variables(**kwargs):
@@ -24,11 +140,7 @@ def get_setup_env_variables(**kwargs):
         env_vars[str(key)] = value
 
     # Use specified pip index url instead of default(https://pypi.org/simple) if related environment variables exists
-    if (
-        "PIP_INDEX_URL" in os.environ
-        and os.environ.get("PIP_INDEX_URL") != None
-        and os.environ.get("PIP_INDEX_URL") != ""
-    ):
+    if os.environ.get("PIP_INDEX_URL", "") != "":
         env_vars["PIP_INDEX_URL"] = os.environ.get("PIP_INDEX_URL")
         env_vars["PIP_TRUSTED_HOST"] = os.environ.get("PIP_TRUSTED_HOST")
     else:
@@ -36,11 +148,7 @@ def get_setup_env_variables(**kwargs):
         env_vars["PIP_TRUSTED_HOST"] = "pypi.org"
 
     # Use specified storage bucket reference from which to download datasets
-    if (
-        "AWS_DEFAULT_ENDPOINT" in os.environ
-        and os.environ.get("AWS_DEFAULT_ENDPOINT") != None
-        and os.environ.get("AWS_DEFAULT_ENDPOINT") != ""
-    ):
+    if os.environ.get("AWS_DEFAULT_ENDPOINT", "") != "":
         env_vars["AWS_DEFAULT_ENDPOINT"] = os.environ.get("AWS_DEFAULT_ENDPOINT")
         env_vars["AWS_ACCESS_KEY_ID"] = os.environ.get("AWS_ACCESS_KEY_ID")
         env_vars["AWS_SECRET_ACCESS_KEY"] = os.environ.get("AWS_SECRET_ACCESS_KEY")
@@ -51,16 +159,231 @@ def get_setup_env_variables(**kwargs):
     return env_vars
 
 
+def _env_flag_enabled(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _env_flag_disabled(name):
+    return os.environ.get(name, "").strip().lower() in ("0", "false", "no", "off")
+
+
+def _disconnected_cluster_signals():
+    """Return True when the cluster is likely disconnected / air-gapped."""
+    if _env_flag_enabled("DISCONNECTED_CLUSTER") or _env_flag_enabled(
+        "IS_DISCONNECTED_CLUSTER"
+    ):
+        return True
+    try:
+        server = (run_oc_command(["whoami", "--show-server=true"]) or "").lower()
+        if "-dis-" in server or "disconnected" in server:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _mnist_prerequisites_met():
+    """
+    Return True when full MNIST can run (pip packages + dataset reachable).
+
+    Connected labs may use public PyPI and MNIST mirrors with no extra env.
+    Disconnected labs need internal PIP_INDEX_URL and AWS_DEFAULT_ENDPOINT (MinIO).
+    """
+    if not _disconnected_cluster_signals():
+        return True
+
+    pip_url = (os.environ.get("PIP_INDEX_URL") or "").strip()
+    aws_endpoint = (os.environ.get("AWS_DEFAULT_ENDPOINT") or "").strip()
+    pip_ok = bool(pip_url) and "pypi.org" not in pip_url
+    aws_ok = bool(aws_endpoint)
+    if pip_ok and aws_ok:
+        print(
+            "Disconnected cluster with PIP mirror and S3 endpoint configured; "
+            "using full MNIST job"
+        )
+        return True
+    return False
+
+
+def use_smoke_job():
+    """
+    Use a lightweight Ray job when full MNIST is not viable.
+
+    Detection order (first match wins):
+      1. USE_SMOKE_JOB / UPGRADE_USE_SMOKE_JOB=true|false (explicit override)
+      2. Full MNIST prerequisites met (connected, or disconnected with mirrors)
+      3. DISCONNECTED_CLUSTER / IS_DISCONNECTED_CLUSTER env (Jenkins)
+      4. API server URL heuristic (-dis- / disconnected), last resort
+
+    ImageDigestMirrorSet / ICSP are intentionally not used: many connected
+    OpenShift clusters mirror container registries without blocking pip/PyPI.
+    """
+    for name in ("USE_SMOKE_JOB", "UPGRADE_USE_SMOKE_JOB"):
+        if _env_flag_enabled(name):
+            print(f"{name} enabled; using smoke job (no pip install)")
+            return True
+        if _env_flag_disabled(name):
+            print(f"{name} disabled; using full MNIST job")
+            return False
+
+    if _mnist_prerequisites_met():
+        return False
+
+    if _env_flag_enabled("DISCONNECTED_CLUSTER") or _env_flag_enabled(
+        "IS_DISCONNECTED_CLUSTER"
+    ):
+        print(
+            "Disconnected cluster env set without PIP/S3 mirrors; "
+            "using smoke job (no pip install)"
+        )
+        return True
+
+    try:
+        server = (run_oc_command(["whoami", "--show-server=true"]) or "").lower()
+        if "-dis-" in server or "disconnected" in server:
+            print(
+                "Detected disconnected cluster from API server URL; "
+                "using smoke job (no pip install)"
+            )
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def use_upgrade_smoke_job():
+    """Backward-compatible alias for upgrade tests."""
+    return use_smoke_job()
+
+
+def get_mnist_job_submission_spec(**kwargs):
+    """Return entrypoint and runtime_env for tier1 / upgrade MNIST job submission tests."""
+    env_vars = get_setup_env_variables(**kwargs)
+    if use_smoke_job():
+        return {
+            "entrypoint": "python upgrade_job_smoke.py",
+            "runtime_env": {
+                "working_dir": "./tests/e2e/",
+                "env_vars": env_vars,
+            },
+        }
+    return {
+        "entrypoint": "python mnist.py",
+        "runtime_env": {
+            "working_dir": "./tests/e2e/",
+            "pip": "./tests/e2e/mnist_pip_requirements.txt",
+            "env_vars": env_vars,
+        },
+    }
+
+
+def get_upgrade_job_submission_spec():
+    """Backward-compatible alias for post-upgrade job submission tests."""
+    return get_mnist_job_submission_spec()
+
+
 def random_choice():
     alphabet = string.ascii_lowercase + string.digits
     return "".join(random.choices(alphabet, k=5))
 
 
+def _parse_label_env(env_var, default):
+    """Parse label from environment variable (format: 'key=value')."""
+    label_str = os.getenv(env_var, default)
+    return label_str.split("=")
+
+
+def get_master_taint_key(self):
+    """
+    Detect the actual master/control-plane taint key from nodes.
+    Returns the taint key if found, or defaults to control-plane.
+    """
+    # Check env var first (most efficient)
+    if os.getenv("TOLERATION_KEY"):
+        return os.getenv("TOLERATION_KEY")
+
+    # Try to detect from cluster nodes
+    try:
+        nodes = self.api_instance.list_node()
+        taint_key = next(
+            (
+                taint.key
+                for node in nodes.items
+                if node.spec.taints
+                for taint in node.spec.taints
+                if taint.key
+                in [
+                    "node-role.kubernetes.io/master",
+                    "node-role.kubernetes.io/control-plane",
+                ]
+            ),
+            None,
+        )
+        if taint_key:
+            return taint_key
+    except Exception as e:
+        print(f"Warning: Could not detect master taint key: {e}")
+
+    # Default fallback
+    return "node-role.kubernetes.io/control-plane"
+
+
+def ensure_nodes_labeled_for_flavors(self, num_flavors, with_labels):
+    """
+    Check if required node labels exist for ResourceFlavor targeting.
+    This handles both default (worker-1=true) and non-default (ingress-ready=true) flavors.
+
+    NOTE: This function does NOT modify cluster nodes. It only checks if required labels exist.
+    If labels don't exist, the test will use whatever labels are available on the cluster.
+    For shared clusters, set WORKER_LABEL and CONTROL_LABEL env vars to match existing labels.
+    """
+    if not with_labels:
+        return
+
+    worker_label, worker_value = _parse_label_env("WORKER_LABEL", "worker-1=true")
+    control_label, control_value = _parse_label_env(
+        "CONTROL_LABEL", "ingress-ready=true"
+    )
+
+    try:
+        worker_nodes = self.api_instance.list_node(
+            label_selector="node-role.kubernetes.io/worker"
+        )
+
+        if not worker_nodes.items:
+            print("Warning: No worker nodes found")
+            return
+
+        # Check labels based on num_flavors
+        labels_to_check = [("WORKER_LABEL", worker_label, worker_value)]
+        if num_flavors > 1:
+            labels_to_check.append(("CONTROL_LABEL", control_label, control_value))
+
+        for env_var, label, value in labels_to_check:
+            has_label = any(
+                node.metadata.labels and node.metadata.labels.get(label) == value
+                for node in worker_nodes.items
+            )
+            if not has_label:
+                print(
+                    f"Warning: Label {label}={value} not found (set {env_var} env var to match existing labels)"
+                )
+
+    except Exception as e:
+        print(f"Warning: Could not check existing labels: {e}")
+
+
 def create_namespace(self):
     try:
         self.namespace = f"test-ns-{random_choice()}"
+        # RHBoK/OpenShift Kueue only manages namespaces with this label
+        # (see kueue-manager-config managedJobsNamespaceSelector).
         namespace_body = client.V1Namespace(
-            metadata=client.V1ObjectMeta(name=self.namespace)
+            metadata=client.V1ObjectMeta(
+                name=self.namespace,
+                labels={"kueue.openshift.io/managed": "true"},
+            )
         )
         self.api_instance.create_namespace(namespace_body)
     except Exception as e:
@@ -95,14 +418,36 @@ def create_new_local_queue(self, num_queues):
         self.local_queues.append(local_queue_name)
 
 
-def create_namespace_with_name(self, namespace_name):
+def create_namespace_with_name(self, namespace_name, kueue_managed=True):
     self.namespace = namespace_name
+    labels = {"kueue.openshift.io/managed": "true"} if kueue_managed else {}
     try:
         namespace_body = client.V1Namespace(
-            metadata=client.V1ObjectMeta(name=self.namespace)
+            metadata=client.V1ObjectMeta(
+                name=self.namespace,
+                labels=labels,
+            )
         )
         self.api_instance.create_namespace(namespace_body)
     except Exception as e:
+        # Check if it's an AlreadyExists error (409 Conflict) and ignore it
+        if hasattr(e, "status") and e.status == 409:
+            print(
+                f"Warning: Namespace '{namespace_name}' already exists, continuing..."
+            )
+            if kueue_managed:
+                try:
+                    self.api_instance.patch_namespace(
+                        namespace_name,
+                        {
+                            "metadata": {
+                                "labels": {"kueue.openshift.io/managed": "true"}
+                            }
+                        },
+                    )
+                except Exception:
+                    pass
+            return
         return _kube_api_error_handling(e)
 
 
@@ -112,10 +457,16 @@ def delete_namespace(self):
 
 
 def initialize_kubernetes_client(self):
-    config.load_kube_config()
-    # Initialize Kubernetes client
+    """
+    Initialize Kubernetes client with simplified kube-authkit authentication.
+    """
+    # Set up authentication using kube-authkit auto-detection
+    if not setup_authentication():
+        raise RuntimeError("Failed to set up authentication")
+
+    # Create the client instances we need
     self.api_instance = client.CoreV1Api()
-    self.custom_api = client.CustomObjectsApi(self.api_instance.api_client)
+    self.custom_api = client.CustomObjectsApi()
 
 
 def run_oc_command(args):
@@ -127,6 +478,77 @@ def run_oc_command(args):
     except subprocess.CalledProcessError as e:
         print(f"Error executing 'oc {' '.join(args)}': {e}")
         return None
+
+
+def run_kubectl_command(args):
+    try:
+        result = subprocess.run(
+            ["kubectl"] + args, capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"Error executing 'kubectl {' '.join(args)}': {e}")
+        return None
+
+
+def wait_for_worker_count(self, cluster_name, predicate, timeout_s=600):
+    """Wait until the number of worker pods for cluster_name satisfies predicate."""
+    label = f"ray.io/node-type=worker,ray.io/cluster={cluster_name}"
+    start = time.time()
+    last = None
+    while time.time() - start < timeout_s:
+        pods = self.api_instance.list_namespaced_pod(
+            self.namespace, label_selector=label
+        )
+        last = len(pods.items or [])
+        if predicate(last):
+            return last
+        sleep(10)
+    raise TimeoutError(
+        f"Timed out waiting for worker count. cluster={cluster_name} last={last}"
+    )
+
+
+def run_autoscaling_load_in_head_pod(self, cluster_name, tasks=2, sleep_s=120):
+    """
+    Copy autoscaling_load.py into the head pod and run it asynchronously.
+    Returns the Popen handle so the caller can check for scale-up while
+    the workload is still running (avoids the race where blocking execution
+    lets workers scale back down before the assertion runs).
+    """
+    label = f"ray.io/node-type=head,ray.io/cluster={cluster_name}"
+    pods = self.api_instance.list_namespaced_pod(self.namespace, label_selector=label)
+    if not pods.items:
+        raise RuntimeError(f"No head pod found for cluster {cluster_name}")
+    head_pod = pods.items[0].metadata.name
+
+    load_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "autoscaling_load.py"
+    )
+
+    subprocess.check_call(
+        [
+            "kubectl",
+            "cp",
+            load_script,
+            f"{self.namespace}/{head_pod}:/tmp/autoscaling_load.py",
+        ]
+    )
+
+    return subprocess.Popen(
+        [
+            "kubectl",
+            "exec",
+            "-n",
+            self.namespace,
+            head_pod,
+            "--",
+            "bash",
+            "-lc",
+            f"AUTOSCALING_TASKS={tasks} AUTOSCALING_TASK_SLEEP_S={sleep_s} "
+            f"python /tmp/autoscaling_load.py",
+        ]
+    )
 
 
 def create_cluster_queue(self, cluster_queue, flavor):
@@ -143,9 +565,9 @@ def create_cluster_queue(self, cluster_queue, flavor):
                         {
                             "name": flavor,
                             "resources": [
-                                {"name": "cpu", "nominalQuota": 9},
-                                {"name": "memory", "nominalQuota": "36Gi"},
-                                {"name": "nvidia.com/gpu", "nominalQuota": 1},
+                                {"name": "cpu", "nominalQuota": 20},
+                                {"name": "memory", "nominalQuota": "80Gi"},
+                                {"name": "nvidia.com/gpu", "nominalQuota": 2},
                             ],
                         },
                     ],
@@ -179,13 +601,12 @@ def create_cluster_queue(self, cluster_queue, flavor):
 def create_resource_flavor(
     self, flavor, default=True, with_labels=False, with_tolerations=False
 ):
-    worker_label, worker_value = os.getenv("WORKER_LABEL", "worker-1=true").split("=")
-    control_label, control_value = os.getenv(
+    worker_label, worker_value = _parse_label_env("WORKER_LABEL", "worker-1=true")
+    control_label, control_value = _parse_label_env(
         "CONTROL_LABEL", "ingress-ready=true"
-    ).split("=")
-    toleration_key = os.getenv(
-        "TOLERATION_KEY", "node-role.kubernetes.io/control-plane"
     )
+
+    toleration_key = os.getenv("TOLERATION_KEY") or get_master_taint_key(self)
 
     node_labels = {}
     if with_labels:
@@ -283,7 +704,6 @@ def create_kueue_resources(
 
 
 def delete_kueue_resources(self):
-    # Delete if given cluster-queue exists
     for cq in self.cluster_queues:
         try:
             self.custom_api.delete_cluster_custom_object(
@@ -351,6 +771,81 @@ def get_nodes_by_label(self, node_labels):
     return [node.metadata.name for node in nodes.items]
 
 
+def get_tolerations_from_flavor(self, flavor_name):
+    """
+    Extract tolerations from a ResourceFlavor and convert them to V1Toleration objects.
+    Returns a list of V1Toleration objects, or empty list if no tolerations found.
+    """
+    flavor_spec = get_flavor_spec(self, flavor_name)
+    tolerations_spec = flavor_spec.get("spec", {}).get("tolerations", [])
+
+    return [
+        V1Toleration(
+            key=tol_spec.get("key"),
+            operator=tol_spec.get("operator", "Equal"),
+            value=tol_spec.get("value"),
+            effect=tol_spec.get("effect"),
+        )
+        for tol_spec in tolerations_spec
+    ]
+
+
+def is_byoidc_cluster_detected():
+    """
+    BYOIDC cluster detection by checking OpenShift cluster Authentication resource.
+    Detection is based solely on cluster state — no environment variable fallback.
+    """
+    try:
+        from kubernetes import client as k8s_client
+
+        custom_api = k8s_client.CustomObjectsApi()
+        auth_resource = custom_api.get_cluster_custom_object(
+            group="config.openshift.io",
+            version="v1",
+            plural="authentications",
+            name="cluster",
+        )
+
+        spec = auth_resource.get("spec", {})
+
+        # BYOIDC clusters register Authentication.spec.type as OIDC
+        if (spec.get("type") or "").upper() == "OIDC":
+            print("Detected BYOIDC cluster: Authentication spec.type is OIDC")
+            return True
+
+        # Check oidcProviders for Keycloak / QE BYOIDC issuer URLs
+        if "oidcProviders" in spec and spec["oidcProviders"]:
+            for provider in spec["oidcProviders"]:
+                issuer_url = provider.get("issuer", {}).get("issuerURL", "")
+                if "keycloak" in issuer_url.lower() and (
+                    "rh-ods.com" in issuer_url or "qe.rh-ods.com" in issuer_url
+                ):
+                    print(f"Detected BYOIDC cluster with OIDC issuer: {issuer_url}")
+                    return True
+
+        # Check webhookTokenAuthenticators (external OIDC token review)
+        if spec.get("webhookTokenAuthenticators"):
+            for webhook in spec["webhookTokenAuthenticators"]:
+                if webhook.get("kubeConfig", {}):
+                    print("Detected BYOIDC cluster with webhook token authenticator")
+                    return True
+
+        # status.oidcClients with componentName "cli" is NOT BYOIDC-specific (false positive
+        # on standard OpenShift). BYOIDC registers client id "oc-cli" — see run-tests.sh.
+        status = auth_resource.get("status", {})
+        oidc_clients_blob = json.dumps(status.get("oidcClients", []))
+        if "oc-cli" in oidc_clients_blob:
+            print("Detected BYOIDC cluster from status.oidcClients (oc-cli client)")
+            return True
+
+        print("No BYOIDC indicators found in cluster Authentication resource")
+        return False
+
+    except Exception as e:
+        print(f"Could not check cluster authentication method: {e}")
+        return False
+
+
 def assert_get_cluster_and_jobsubmit(
     self, cluster_name, accelerator=None, number_of_gpus=None
 ):
@@ -359,22 +854,43 @@ def assert_get_cluster_and_jobsubmit(
 
     cluster.details()
 
-    # Initialize the job client
-    client = cluster.job_client
+    is_byoidc_cluster = is_byoidc_cluster_detected()
+    if is_byoidc_cluster:
+        # On BYOIDC clusters cluster.job_client uses oc whoami --show-token=true which
+        # is unavailable. Obtain an OIDC id_token via Keycloak password grant instead.
+        username = os.environ.get("OCP_ADMIN_USER_USERNAME", "")
+        password = os.environ.get("OCP_ADMIN_USER_PASSWORD", "")
+        if not username or not password:
+            raise RuntimeError(
+                "OCP_ADMIN_USER_USERNAME and OCP_ADMIN_USER_PASSWORD must be set "
+                "for BYOIDC job submission"
+            )
+        issuer_url = get_byoidc_issuer_url()
+        id_token, _ = get_oidc_tokens(username, password, issuer_url)
+        if not id_token:
+            raise RuntimeError(
+                "Failed to obtain OIDC token for Ray Dashboard authentication. "
+                "Check OCP_ADMIN_USER_PASSWORD."
+            )
+        from codeflare_sdk.ray.client import RayJobClient
+
+        ray_dashboard = cluster.cluster_dashboard_uri()
+        client = RayJobClient(
+            address=ray_dashboard,
+            headers={"Authorization": f"Bearer {id_token}"},
+            verify=False,
+        )
+    else:
+        # Initialize the job client
+        client = cluster.job_client
 
     # Submit a job and get the submission ID
-    env_vars = (
-        get_setup_env_variables(ACCELERATOR=accelerator)
-        if accelerator
-        else get_setup_env_variables()
-    )
+    spec_kwargs = {"ACCELERATOR": accelerator} if accelerator else {}
+    job_spec = get_mnist_job_submission_spec(**spec_kwargs)
+    print(f"Submitting job: {job_spec['entrypoint']}")
     submission_id = client.submit_job(
-        entrypoint="python mnist.py",
-        runtime_env={
-            "working_dir": "./tests/e2e/",
-            "pip": "./tests/e2e/mnist_pip_requirements.txt",
-            "env_vars": env_vars,
-        },
+        entrypoint=job_spec["entrypoint"],
+        runtime_env=job_spec["runtime_env"],
         entrypoint_num_cpus=1 if number_of_gpus is None else None,
         entrypoint_num_gpus=number_of_gpus,
     )
@@ -391,3 +907,1412 @@ def assert_get_cluster_and_jobsubmit(
     assert job_list[0].submission_id == submission_id
 
     cluster.down()
+
+
+def wait_for_kueue_admission(self, job_api, job_name, namespace, timeout=120):
+    print(f"Waiting for Kueue admission of job '{job_name}'...")
+    elapsed_time = 0
+    check_interval = 5
+
+    while elapsed_time < timeout:
+        try:
+            job_cr = job_api.get_job(name=job_name, k8s_namespace=namespace)
+
+            # Check if the job is no longer suspended
+            is_suspended = job_cr.get("spec", {}).get("suspend", False)
+
+            if not is_suspended:
+                print(f"✓ Job '{job_name}' admitted by Kueue (no longer suspended)")
+                return True
+
+            # Debug: Check workload status every 10 seconds
+            if elapsed_time % 10 == 0:
+                workload = get_kueue_workload_for_job(self, job_name, namespace)
+                if workload:
+                    conditions = workload.get("status", {}).get("conditions", [])
+                    print(f"DEBUG: Workload conditions for '{job_name}':")
+                    for condition in conditions:
+                        print(
+                            f"    - {condition.get('type')}: {condition.get('status')} - {condition.get('reason', '')} - {condition.get('message', '')}"
+                        )
+
+            # Optional: Check status conditions for more details
+            conditions = job_cr.get("status", {}).get("conditions", [])
+            for condition in conditions:
+                if (
+                    condition.get("type") == "Suspended"
+                    and condition.get("status") == "False"
+                ):
+                    print(
+                        f"✓ Job '{job_name}' admitted by Kueue (Suspended=False condition)"
+                    )
+                    return True
+
+        except Exception as e:
+            print(f"Error checking job status: {e}")
+
+        sleep(check_interval)
+        elapsed_time += check_interval
+
+    print(f"✗ Timeout waiting for Kueue admission of job '{job_name}'")
+    return False
+
+
+def create_limited_kueue_resources(self):
+    print("Creating limited Kueue resources for preemption testing...")
+
+    # Create a resource flavor with default (no special labels/tolerations)
+    resource_flavor = f"limited-flavor-{random_choice()}"
+    create_resource_flavor(
+        self, resource_flavor, default=True, with_labels=False, with_tolerations=False
+    )
+    self.resource_flavors = [resource_flavor]
+
+    # Create a cluster queue with very limited resources.
+    # Jobs use head_memory_requests=7 (see get_platform_appropriate_resources) and
+    # num_workers=0, so quota must fit one job (~7Gi) but not two (~14Gi).
+    # 15Gi previously allowed both jobs (7+7=14 < 15) and broke queueing assertions.
+    cpu_quota = 3
+    memory_quota = "10Gi"
+
+    cluster_queue_name = f"limited-cq-{random_choice()}"
+    cluster_queue_json = {
+        "apiVersion": "kueue.x-k8s.io/v1beta1",
+        "kind": "ClusterQueue",
+        "metadata": {"name": cluster_queue_name},
+        "spec": {
+            "namespaceSelector": {},
+            "resourceGroups": [
+                {
+                    "coveredResources": ["cpu", "memory"],
+                    "flavors": [
+                        {
+                            "name": resource_flavor,
+                            "resources": [
+                                {
+                                    "name": "cpu",
+                                    "nominalQuota": cpu_quota,
+                                },
+                                {
+                                    "name": "memory",
+                                    "nominalQuota": memory_quota,
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+    try:
+        self.custom_api.create_cluster_custom_object(
+            group="kueue.x-k8s.io",
+            plural="clusterqueues",
+            version="v1beta1",
+            body=cluster_queue_json,
+        )
+        print(f"✓ Created limited ClusterQueue: {cluster_queue_name}")
+    except Exception as e:
+        print(f"Error creating limited ClusterQueue: {e}")
+        raise
+
+    self.cluster_queues = [cluster_queue_name]
+
+    # Create a local queue
+    local_queue_name = f"limited-lq-{random_choice()}"
+    create_local_queue(self, cluster_queue_name, local_queue_name, is_default=True)
+    self.local_queues = [local_queue_name]
+
+    print("✓ Limited Kueue resources created successfully")
+
+
+def get_kueue_workload_for_job(self, job_name, namespace):
+    try:
+        # List all workloads in the namespace
+        workloads = self.custom_api.list_namespaced_custom_object(
+            group="kueue.x-k8s.io",
+            version="v1beta1",
+            plural="workloads",
+            namespace=namespace,
+        )
+
+        # Find workload with matching RayJob owner reference
+        for workload in workloads.get("items", []):
+            owner_refs = workload.get("metadata", {}).get("ownerReferences", [])
+
+            for owner_ref in owner_refs:
+                if (
+                    owner_ref.get("kind") == "RayJob"
+                    and owner_ref.get("name") == job_name
+                ):
+                    workload_name = workload.get("metadata", {}).get("name")
+                    print(
+                        f"✓ Found Kueue workload '{workload_name}' for RayJob '{job_name}'"
+                    )
+                    return workload
+
+        print(f"✗ No Kueue workload found for RayJob '{job_name}'")
+        return None
+
+    except Exception as e:
+        print(f"Error getting Kueue workload for job '{job_name}': {e}")
+        return None
+
+
+def wait_for_job_status(
+    job_api, rayjob_name: str, namespace: str, expected_status: str, timeout: int = 30
+) -> bool:
+    """
+    Wait for a RayJob to reach a specific deployment status.
+
+    Args:
+        job_api: RayjobApi instance
+        rayjob_name: Name of the RayJob
+        namespace: Namespace of the RayJob
+        expected_status: Expected jobDeploymentStatus value
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        bool: True if status reached, False if timeout
+    """
+    elapsed_time = 0
+    check_interval = 2
+
+    while elapsed_time < timeout:
+        status = job_api.get_job_status(name=rayjob_name, k8s_namespace=namespace)
+        if status and status.get("jobDeploymentStatus") == expected_status:
+            return True
+
+        sleep(check_interval)
+        elapsed_time += check_interval
+
+    return False
+
+
+def verify_rayjob_cluster_cleanup(
+    cluster_api, rayjob_name: str, namespace: str, timeout: int = 60
+):
+    """
+    Verify that the RayCluster created by a RayJob has been cleaned up.
+    Handles KubeRay's automatic suffix addition to cluster names.
+
+    Args:
+        cluster_api: RayClusterApi instance
+        rayjob_name: Name of the RayJob
+        namespace: Namespace to check
+        timeout: Maximum time to wait in seconds
+
+    Raises:
+        TimeoutError: If cluster is not cleaned up within timeout
+    """
+    elapsed_time = 0
+    check_interval = 5
+
+    while elapsed_time < timeout:
+        # List all RayClusters in the namespace
+        clusters = cluster_api.list_ray_clusters(
+            k8s_namespace=namespace, async_req=False
+        )
+
+        # Check if any cluster exists that starts with our job name
+        found = False
+        for cluster in clusters.get("items", []):
+            cluster_name = cluster.get("metadata", {}).get("name", "")
+            # KubeRay creates clusters with pattern: {job_name}-raycluster-{suffix}
+            if cluster_name.startswith(f"{rayjob_name}-raycluster"):
+                found = True
+                break
+
+        if not found:
+            # No cluster found, cleanup successful
+            return
+
+        sleep(check_interval)
+        elapsed_time += check_interval
+
+    raise TimeoutError(
+        f"RayCluster for job '{rayjob_name}' was not cleaned up within {timeout} seconds"
+    )
+
+
+# =============================================================================
+# Gateway API Resource Helper Functions
+# =============================================================================
+
+
+def get_reference_grant(
+    custom_api,
+    namespace: str,
+    name: str = "kuberay-gateway-access",
+):
+    """
+    Get a ReferenceGrant resource by name from a namespace.
+
+    Args:
+        custom_api: Kubernetes CustomObjectsApi instance
+        namespace: Namespace to search in
+        name: Name of the ReferenceGrant (default: "kuberay-gateway-access")
+
+    Returns:
+        ReferenceGrant resource dict if found, None otherwise
+    """
+    try:
+        return custom_api.get_namespaced_custom_object(
+            group="gateway.networking.k8s.io",
+            version="v1beta1",
+            namespace=namespace,
+            plural="referencegrants",
+            name=name,
+        )
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def list_reference_grants(
+    custom_api,
+    namespace: str,
+):
+    """
+    List all ReferenceGrant resources in a namespace.
+
+    Args:
+        custom_api: Kubernetes CustomObjectsApi instance
+        namespace: Namespace to search in
+
+    Returns:
+        List of ReferenceGrant resources
+    """
+    try:
+        result = custom_api.list_namespaced_custom_object(
+            group="gateway.networking.k8s.io",
+            version="v1beta1",
+            namespace=namespace,
+            plural="referencegrants",
+        )
+        return result.get("items", [])
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return []
+        raise
+
+
+def get_httproutes_for_cluster(
+    custom_api,
+    cluster_name: str,
+    namespace: str,
+):
+    """
+    Get HTTPRoute resources for a specific RayCluster.
+
+    HTTPRoutes for RayClusters are typically labeled with:
+    - ray.io/cluster-name=<cluster_name>
+    - ray.io/cluster-namespace=<namespace>
+
+    Args:
+        custom_api: Kubernetes CustomObjectsApi instance
+        cluster_name: Name of the RayCluster
+        namespace: Namespace of the RayCluster
+
+    Returns:
+        List of matching HTTPRoute resources
+    """
+    label_selector = (
+        f"ray.io/cluster-name={cluster_name},ray.io/cluster-namespace={namespace}"
+    )
+
+    # Try cluster-wide search first (if permissions allow)
+    try:
+        result = custom_api.list_cluster_custom_object(
+            group="gateway.networking.k8s.io",
+            version="v1",
+            plural="httproutes",
+            label_selector=label_selector,
+        )
+        return result.get("items", [])
+    except client.exceptions.ApiException:
+        # Fall back to searching specific namespaces
+        search_namespaces = [
+            namespace,
+            "redhat-ods-applications",
+            "opendatahub",
+            "default",
+            "ray-system",
+        ]
+
+        httproutes = []
+        for ns in search_namespaces:
+            try:
+                result = custom_api.list_namespaced_custom_object(
+                    group="gateway.networking.k8s.io",
+                    version="v1",
+                    namespace=ns,
+                    plural="httproutes",
+                    label_selector=label_selector,
+                )
+                httproutes.extend(result.get("items", []))
+            except client.exceptions.ApiException:
+                continue
+
+        return httproutes
+
+
+def get_network_policies_for_cluster(
+    networking_api,
+    cluster_name: str,
+    namespace: str,
+):
+    """
+    Get NetworkPolicy resources related to a RayCluster.
+
+    NetworkPolicies for RayClusters typically have labels or name patterns
+    that match the cluster name.
+
+    Args:
+        networking_api: Kubernetes NetworkingV1Api instance
+        cluster_name: Name of the RayCluster
+        namespace: Namespace of the RayCluster
+
+    Returns:
+        List of matching NetworkPolicy resources
+    """
+    try:
+        # List all network policies in the namespace
+        all_policies = networking_api.list_namespaced_network_policy(namespace)
+
+        # Filter policies that are related to the cluster
+        # KubeRay typically creates policies with the cluster name in the name or labels
+        matching_policies = []
+        for policy in all_policies.items:
+            policy_name = policy.metadata.name
+            policy_labels = policy.metadata.labels or {}
+
+            # Check if policy name contains cluster name
+            if cluster_name in policy_name:
+                matching_policies.append(policy)
+                continue
+
+            # Check if policy has ray.io/cluster label
+            if policy_labels.get("ray.io/cluster") == cluster_name:
+                matching_policies.append(policy)
+                continue
+
+            # Check if policy has ray.io/cluster-name label
+            if policy_labels.get("ray.io/cluster-name") == cluster_name:
+                matching_policies.append(policy)
+                continue
+
+        return matching_policies
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return []
+        raise
+
+
+def wait_for_reference_grant(
+    custom_api,
+    namespace: str,
+    name: str = "kuberay-gateway-access",
+    timeout: int = 120,
+):
+    """
+    Wait for a ReferenceGrant to be created.
+
+    Args:
+        custom_api: Kubernetes CustomObjectsApi instance
+        namespace: Namespace to search in
+        name: Name of the ReferenceGrant
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        ReferenceGrant resource if found within timeout, None otherwise
+    """
+    elapsed = 0
+    interval = 5
+
+    while elapsed < timeout:
+        grant = get_reference_grant(custom_api, namespace, name)
+        if grant:
+            return grant
+
+        sleep(interval)
+        elapsed += interval
+
+    return None
+
+
+def wait_for_httproute(
+    custom_api,
+    cluster_name: str,
+    namespace: str,
+    timeout: int = 120,
+):
+    """
+    Wait for HTTPRoute(s) to be created for a RayCluster.
+
+    Args:
+        custom_api: Kubernetes CustomObjectsApi instance
+        cluster_name: Name of the RayCluster
+        namespace: Namespace of the RayCluster
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        List of HTTPRoute resources if found within timeout, empty list otherwise
+    """
+    elapsed = 0
+    interval = 5
+
+    while elapsed < timeout:
+        routes = get_httproutes_for_cluster(custom_api, cluster_name, namespace)
+        if routes:
+            return routes
+
+        sleep(interval)
+        elapsed += interval
+
+    return []
+
+
+def wait_for_network_policies(
+    networking_api,
+    cluster_name: str,
+    namespace: str,
+    timeout: int = 120,
+):
+    """
+    Wait for NetworkPolicy resources to be created for a RayCluster.
+
+    Args:
+        networking_api: Kubernetes NetworkingV1Api instance
+        cluster_name: Name of the RayCluster
+        namespace: Namespace of the RayCluster
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        List of NetworkPolicy resources if found within timeout, empty list otherwise
+    """
+    elapsed = 0
+    interval = 5
+
+    while elapsed < timeout:
+        policies = get_network_policies_for_cluster(
+            networking_api, cluster_name, namespace
+        )
+        if policies:
+            return policies
+
+        sleep(interval)
+        elapsed += interval
+
+    return []
+
+
+# =============================================================================
+# Resource Cleanup Verification Helper Functions
+# =============================================================================
+
+
+def wait_for_reference_grant_deletion(
+    custom_api,
+    namespace: str,
+    name: str = "kuberay-gateway-access",
+    timeout: int = 120,
+) -> bool:
+    """
+    Wait for a ReferenceGrant to be deleted.
+
+    Args:
+        custom_api: Kubernetes CustomObjectsApi instance
+        namespace: Namespace to check
+        name: Name of the ReferenceGrant
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        True if deleted within timeout, False otherwise
+    """
+    elapsed = 0
+    interval = 5
+
+    while elapsed < timeout:
+        grant = get_reference_grant(custom_api, namespace, name)
+        if grant is None:
+            return True
+
+        sleep(interval)
+        elapsed += interval
+
+    return False
+
+
+def wait_for_httproute_deletion(
+    custom_api,
+    cluster_name: str,
+    namespace: str,
+    timeout: int = 120,
+) -> bool:
+    """
+    Wait for HTTPRoute(s) to be deleted for a RayCluster.
+
+    Args:
+        custom_api: Kubernetes CustomObjectsApi instance
+        cluster_name: Name of the RayCluster
+        namespace: Namespace of the RayCluster
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        True if all HTTPRoutes deleted within timeout, False otherwise
+    """
+    elapsed = 0
+    interval = 5
+
+    while elapsed < timeout:
+        routes = get_httproutes_for_cluster(custom_api, cluster_name, namespace)
+        if not routes:
+            return True
+
+        sleep(interval)
+        elapsed += interval
+
+    return False
+
+
+def wait_for_network_policies_deletion(
+    networking_api,
+    cluster_name: str,
+    namespace: str,
+    timeout: int = 120,
+):
+    """
+    Wait for NetworkPolicy resources to be deleted for a RayCluster.
+
+    Args:
+        networking_api: Kubernetes NetworkingV1Api instance
+        cluster_name: Name of the RayCluster
+        namespace: Namespace of the RayCluster
+        timeout: Maximum time to wait in seconds
+
+    Returns:
+        Empty list if all deleted, otherwise list of remaining policies
+    """
+    elapsed = 0
+    interval = 5
+
+    while elapsed < timeout:
+        policies = get_network_policies_for_cluster(
+            networking_api, cluster_name, namespace
+        )
+        if not policies:
+            return []
+
+        sleep(interval)
+        elapsed += interval
+
+    # Return remaining policies that weren't deleted
+    return policies
+
+
+def verify_reference_grant_spec(
+    reference_grant,
+    expected_from_namespaces=None,
+) -> bool:
+    """
+    Verify the ReferenceGrant has correct spec configuration.
+
+    A valid ReferenceGrant for KubeRay Gateway access should have:
+    - 'from' entries specifying which namespaces/groups can reference services
+    - 'to' entries specifying what resources can be referenced
+
+    Args:
+        reference_grant: ReferenceGrant resource dict
+        expected_from_namespaces: Optional list of expected source namespaces
+
+    Returns:
+        True if spec is valid, False otherwise
+    """
+    spec = reference_grant.get("spec", {})
+
+    # Verify 'from' entries exist
+    from_entries = spec.get("from", [])
+    if not from_entries:
+        print("ReferenceGrant has no 'from' entries")
+        return False
+
+    # Verify 'to' entries exist
+    to_entries = spec.get("to", [])
+    if not to_entries:
+        print("ReferenceGrant has no 'to' entries")
+        return False
+
+    # Verify 'to' contains Service kind
+    has_service_to = any(
+        entry.get("kind") == "Service" or entry.get("group") == ""
+        for entry in to_entries
+    )
+    if not has_service_to:
+        print("ReferenceGrant does not allow Service references")
+        return False
+
+    # If expected namespaces specified, verify they are present
+    if expected_from_namespaces:
+        from_namespaces = set()
+        for entry in from_entries:
+            ns = entry.get("namespace")
+            if ns:
+                from_namespaces.add(ns)
+
+        for expected_ns in expected_from_namespaces:
+            if expected_ns not in from_namespaces:
+                print(
+                    f"Expected namespace '{expected_ns}' not in ReferenceGrant 'from'"
+                )
+                return False
+
+    return True
+
+
+def verify_httproute_spec(
+    httproute,
+    cluster_name: str,
+    namespace: str,
+) -> bool:
+    """
+    Verify the HTTPRoute has correct spec configuration for a RayCluster.
+
+    A valid HTTPRoute for Ray dashboard access should have:
+    - parentRefs pointing to a Gateway
+    - rules with backendRefs pointing to the cluster's service
+    - hostnames or path matching for routing
+
+    Args:
+        httproute: HTTPRoute resource dict
+        cluster_name: Expected cluster name
+        namespace: Expected namespace
+
+    Returns:
+        True if spec is valid, False otherwise
+    """
+    spec = httproute.get("spec", {})
+    metadata = httproute.get("metadata", {})
+    labels = metadata.get("labels", {})
+
+    # Verify labels match the cluster
+    if labels.get("ray.io/cluster-name") != cluster_name:
+        print(f"HTTPRoute cluster-name label mismatch: expected {cluster_name}")
+        return False
+
+    if labels.get("ray.io/cluster-namespace") != namespace:
+        print(f"HTTPRoute cluster-namespace label mismatch: expected {namespace}")
+        return False
+
+    # Verify parentRefs exist (points to Gateway)
+    parent_refs = spec.get("parentRefs", [])
+    if not parent_refs:
+        print("HTTPRoute has no parentRefs")
+        return False
+
+    # Verify rules exist
+    rules = spec.get("rules", [])
+    if not rules:
+        print("HTTPRoute has no rules")
+        return False
+
+    # Verify at least one rule has backendRefs
+    has_backend_refs = any(rule.get("backendRefs") for rule in rules)
+    if not has_backend_refs:
+        print("HTTPRoute rules have no backendRefs")
+        return False
+
+    return True
+
+
+def verify_network_policy_spec(
+    policy,
+    cluster_name: str,
+):
+    """
+    Verify a NetworkPolicy has appropriate selectors and ports.
+
+    Returns a dict with verification results:
+    - has_pod_selector: True if policy has a pod selector
+    - has_ingress_rules: True if policy has ingress rules
+    - has_egress_rules: True if policy has egress rules
+    - allowed_ports: List of allowed port numbers
+    - policy_types: List of policy types (Ingress/Egress)
+
+    Args:
+        policy: NetworkPolicy resource
+        cluster_name: Expected cluster name
+
+    Returns:
+        Dict with verification results
+    """
+    result = {
+        "name": policy.metadata.name,
+        "has_pod_selector": False,
+        "has_ingress_rules": False,
+        "has_egress_rules": False,
+        "allowed_ports": [],
+        "policy_types": [],
+        "pod_selector_labels": {},
+    }
+
+    spec = policy.spec
+
+    # Check pod selector
+    if spec.pod_selector:
+        match_labels = spec.pod_selector.match_labels or {}
+        result["has_pod_selector"] = bool(match_labels)
+        result["pod_selector_labels"] = match_labels
+
+    # Check policy types
+    if spec.policy_types:
+        result["policy_types"] = spec.policy_types
+
+    # Check ingress rules
+    if spec.ingress:
+        result["has_ingress_rules"] = True
+        for ingress_rule in spec.ingress:
+            if ingress_rule.ports:
+                for port in ingress_rule.ports:
+                    if port.port:
+                        result["allowed_ports"].append(port.port)
+
+    # Check egress rules
+    if spec.egress:
+        result["has_egress_rules"] = True
+        for egress_rule in spec.egress:
+            if egress_rule.ports:
+                for port in egress_rule.ports:
+                    if port.port:
+                        result["allowed_ports"].append(port.port)
+
+    return result
+
+
+# ============================================================================
+# Authentication Detection and Management Functions
+# ============================================================================
+
+
+def detect_authentication_method():
+    """
+    Simplified authentication method detection for kube-authkit.
+
+    Returns:
+        str: "kube-authkit" for auto-detection, "legacy" for fallback
+    """
+    # Check if we have legacy auth environment variables and no kubeconfig
+    if (
+        os.getenv("OCP_ADMIN_USER_USERNAME")
+        and os.getenv("OCP_ADMIN_USER_PASSWORD")
+        and os.getenv("TEST_USER_USERNAME")
+        and os.getenv("TEST_USER_PASSWORD")
+        and not KUBE_AUTHKIT_AVAILABLE
+    ):
+        print("Detected legacy authentication (kube-authkit not available)")
+        return "legacy"
+
+    # Default to kube-authkit auto-detection (handles BYOIDC, kubeconfig, in-cluster, etc.)
+    print("Using kube-authkit auto-detection for authentication")
+    return "kube-authkit"
+
+
+def get_authentication_config():
+    """
+    Get simplified authentication configuration for kube-authkit.
+
+    Returns:
+        dict: Authentication configuration with method and parameters
+    """
+    auth_method = detect_authentication_method()
+
+    if auth_method == "legacy":
+        return {
+            "method": "legacy",
+            "admin_username": os.getenv("OCP_ADMIN_USER_USERNAME"),
+            "admin_password": os.getenv("OCP_ADMIN_USER_PASSWORD"),
+            "test_username": os.getenv("TEST_USER_USERNAME"),
+            "test_password": os.getenv("TEST_USER_PASSWORD"),
+            "supports_oc_login": True,
+        }
+    else:  # kube-authkit
+        return {"method": "kube-authkit", "supports_auto_detection": True}
+
+
+def setup_authentication():
+    """
+    Set up authentication using kube-authkit auto-detection or legacy fallback.
+
+    Returns:
+        bool: True if authentication was set up successfully
+    """
+    auth_config = get_authentication_config()
+
+    if auth_config["method"] == "legacy":
+        return setup_legacy_authentication(auth_config)
+    else:  # kube-authkit
+        return setup_kube_authkit_authentication()
+
+
+def setup_kube_authkit_authentication():
+    """
+    Set up authentication using kube-authkit auto-detection.
+    Handles BYOIDC, kubeconfig, in-cluster, and other authentication methods automatically.
+
+    Returns:
+        bool: True if authentication was set up successfully
+    """
+    if not KUBE_AUTHKIT_AVAILABLE:
+        print("ERROR: kube-authkit is not available")
+        print("Please install with: pip install kube-authkit")
+        return False
+
+    try:
+        print("Setting up authentication with kube-authkit auto-detection...")
+
+        # Use kube-authkit auto-detection (handles BYOIDC, kubeconfig, in-cluster, etc.)
+        api_client = get_k8s_client()
+
+        # Register the authenticated client with CodeFlare SDK
+        set_api_client(api_client)
+
+        print("✅ Successfully set up authentication with kube-authkit")
+        return True
+
+    except Exception as e:
+        print(f"❌ Failed to set up kube-authkit authentication: {e}")
+        print("Falling back to standard kubeconfig loading...")
+
+        try:
+            # Fallback to standard kubernetes config loading
+            config.load_kube_config()
+            print("✅ Successfully set up authentication with standard kubeconfig")
+            return True
+        except Exception as fallback_e:
+            print(f"❌ Fallback authentication also failed: {fallback_e}")
+            return False
+
+
+def setup_legacy_authentication(auth_config):
+    """
+    Set up legacy authentication using TokenAuthentication.
+
+    Args:
+        auth_config (dict): Authentication configuration
+
+    Returns:
+        bool: True if authentication was set up successfully
+    """
+    if not LEGACY_AUTH_AVAILABLE:
+        print("ERROR: TokenAuthentication is not available")
+        return False
+
+    try:
+        print("Setting up legacy authentication with TokenAuthentication...")
+
+        # For legacy auth, we still need to use oc commands to get token and server
+        if not auth_config.get("supports_oc_login", False):
+            print("ERROR: Legacy authentication requires oc login support")
+            return False
+
+        # This will be handled by individual tests that need TokenAuthentication
+        # The tests will call get_legacy_auth_instance() when needed
+        print("Legacy authentication configuration ready")
+        return True
+
+    except Exception as e:
+        print(f"Failed to set up legacy authentication: {e}")
+        return False
+
+
+def get_legacy_auth_instance():
+    """
+    Get a TokenAuthentication instance for legacy authentication.
+
+    Returns:
+        TokenAuthentication: Configured authentication instance, or None if not available
+    """
+    if not LEGACY_AUTH_AVAILABLE:
+        print("WARNING: TokenAuthentication is not available")
+        return None
+
+    auth_config = get_authentication_config()
+    if auth_config["method"] != "legacy":
+        print("WARNING: Legacy authentication not configured")
+        return None
+
+    try:
+        # Suppress deprecation warnings for legacy auth during transition
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+            auth = TokenAuthentication(
+                token=run_oc_command(["whoami", "--show-token=true"]),
+                server=run_oc_command(["whoami", "--show-server=true"]),
+                skip_tls=True,
+            )
+            return auth
+    except Exception as e:
+        print(f"Failed to create TokenAuthentication instance: {e}")
+        return None
+
+
+def authenticate_for_tests():
+    """
+    Simplified authentication for test execution using kube-authkit.
+
+    Returns:
+        object: Authentication object (TokenAuthentication instance for legacy, None for kube-authkit)
+    """
+    auth_config = get_authentication_config()
+
+    if auth_config["method"] == "legacy":
+        # For legacy tests, return TokenAuthentication instance
+        auth = get_legacy_auth_instance()
+        if auth:
+            auth.login()
+            return auth
+        else:
+            raise RuntimeError("Failed to set up legacy authentication")
+
+    else:  # kube-authkit
+        # kube-authkit handles authentication automatically
+        if setup_authentication():
+            return None  # No explicit auth object needed
+        else:
+            raise RuntimeError("Failed to set up kube-authkit authentication")
+
+
+def verify_authentication_stability():
+    """
+    Verify that authentication is stable and working before critical operations.
+    This helps prevent flaky test failures due to authentication issues.
+
+    Returns:
+        bool: True if authentication is stable, False otherwise
+    """
+    try:
+        # Test basic Kubernetes API access
+        try:
+            k8s_client = initialize_kubernetes_client_standalone()
+        except:
+            # Fallback to basic client initialization
+            k8s_client = client.ApiClient()
+
+        if not k8s_client:
+            print("WARNING: Could not get authenticated Kubernetes client")
+            return False
+
+        # Test API connectivity with a simple call
+        v1 = client.CoreV1Api(k8s_client)
+        v1.list_namespace(limit=1)
+
+        print("✓ Authentication stability verified")
+        return True
+
+    except Exception as e:
+        print(f"WARNING: Authentication stability check failed: {e}")
+        return False
+
+
+def detect_stuck_oauth_proxy_serviceaccount(namespace, timeout_minutes=3):
+    """
+    Detect if AuthenticationController is stuck creating oauth-proxy ServiceAccounts.
+
+    Args:
+        namespace (str): Namespace to check for stuck resources
+        timeout_minutes (int): How long to wait before considering it stuck
+
+    Returns:
+        bool: True if stuck condition detected, False otherwise
+    """
+    try:
+        from datetime import datetime
+
+        v1 = client.CoreV1Api()
+
+        # Check events for the stuck pattern
+        events = v1.list_namespaced_event(namespace=namespace)
+
+        stuck_patterns = [
+            "Waiting for ServiceAccount",
+            "oauth-proxy-sa to be created by AuthenticationController",
+        ]
+
+        for event in events.items:
+            if event.message and any(
+                pattern in event.message for pattern in stuck_patterns
+            ):
+                # Check if this event is recent and persistent
+                if event.first_timestamp:
+                    event_age = (
+                        datetime.now(event.first_timestamp.tzinfo)
+                        - event.first_timestamp
+                    )
+                    if event_age.total_seconds() > (timeout_minutes * 60):
+                        print("🔍 Detected stuck oauth-proxy ServiceAccount creation:")
+                        print(f"   Event: {event.message}")
+                        print(f"   Age: {event_age}")
+                        print(
+                            "   This appears to be a product bug - will attempt cluster recreation"
+                        )
+                        return True
+
+        return False
+
+    except Exception as e:
+        print(f"Warning: Could not check for stuck oauth-proxy ServiceAccounts: {e}")
+        return False
+
+
+def wait_ready_with_stuck_detection(cluster, timeout=600, dashboard_check=True):
+    """
+    Enhanced cluster.wait_ready() with stuck oauth-proxy ServiceAccount detection and recovery.
+
+    This function wraps the normal cluster.wait_ready() call and monitors for the specific
+    issue where AuthenticationController gets stuck creating oauth-proxy ServiceAccounts.
+    If detected, it will recreate the cluster once and retry.
+
+    Args:
+        cluster: The cluster object to wait for
+        timeout (int): Timeout in seconds for wait_ready
+        dashboard_check (bool): Whether to check dashboard connectivity
+
+    Returns:
+        bool: True if cluster becomes ready, False otherwise
+    """
+    import threading
+    import time
+
+    print(
+        f"🔄 Waiting for cluster {cluster.config.name} to be ready (with stuck detection)..."
+    )
+
+    # Track if we've already tried recovery
+    if not hasattr(wait_ready_with_stuck_detection, "_recovery_attempted"):
+        wait_ready_with_stuck_detection._recovery_attempted = {}
+
+    cluster_key = f"{cluster.config.namespace}/{cluster.config.name}"
+    recovery_attempted = wait_ready_with_stuck_detection._recovery_attempted.get(
+        cluster_key, False
+    )
+
+    def monitor_for_stuck_resources():
+        """Background thread to monitor for stuck oauth-proxy ServiceAccounts."""
+        time.sleep(180)  # Wait 3 minutes before checking
+
+        if detect_stuck_oauth_proxy_serviceaccount(
+            cluster.config.namespace, timeout_minutes=3
+        ):
+            print("🚨 Stuck oauth-proxy ServiceAccount detected!")
+            if not recovery_attempted:
+                print("🔄 Attempting cluster recreation to recover...")
+                try:
+                    # Mark recovery as attempted
+                    wait_ready_with_stuck_detection._recovery_attempted[cluster_key] = (
+                        True
+                    )
+
+                    # Delete and recreate the cluster
+                    print(f"🗑️  Deleting stuck cluster {cluster.config.name}...")
+                    cluster.down()
+                    time.sleep(30)  # Wait for cleanup
+
+                    print(f"🚀 Recreating cluster {cluster.config.name}...")
+                    cluster.apply()
+
+                    print(
+                        "✅ Cluster recreation completed - normal wait_ready will continue"
+                    )
+
+                except Exception as e:
+                    print(f"❌ Error during cluster recreation: {e}")
+            else:
+                print("⚠️  Recovery already attempted for this cluster - not retrying")
+
+    # Start monitoring thread
+    if not recovery_attempted:
+        monitor_thread = threading.Thread(
+            target=monitor_for_stuck_resources, daemon=True
+        )
+        monitor_thread.start()
+
+    # Call the normal wait_ready method
+    try:
+        result = cluster.wait_ready(timeout=timeout, dashboard_check=dashboard_check)
+        if result:
+            print(f"✅ Cluster {cluster.config.name} is ready!")
+        else:
+            print(
+                f"❌ Cluster {cluster.config.name} failed to become ready within timeout"
+            )
+        return result
+
+    except Exception as e:
+        print(f"❌ Exception during cluster wait_ready: {e}")
+        return False
+
+
+# Alias for backward compatibility and import issues
+def wait_ready_enhanced(cluster, timeout=600, dashboard_check=True):
+    """Alias for wait_ready_with_stuck_detection"""
+    return wait_ready_with_stuck_detection(cluster, timeout, dashboard_check)
+
+
+def cleanup_authentication(auth_instance=None):
+    """
+    Clean up authentication resources.
+
+    Args:
+        auth_instance: Authentication instance to clean up (for legacy auth)
+    """
+    if auth_instance and hasattr(auth_instance, "logout"):
+        try:
+            auth_instance.logout()
+            print("Successfully logged out from legacy authentication")
+        except Exception as e:
+            print(f"Warning: Failed to logout from legacy authentication: {e}")
+
+    # For BYOIDC and kubeconfig, no explicit cleanup needed
+
+
+def initialize_kubernetes_client_standalone():
+    """
+    Initialize Kubernetes client with simplified authentication.
+    Uses kube-authkit auto-detection or legacy fallback.
+
+    Returns:
+        kubernetes.client.ApiClient: Authenticated Kubernetes client
+    """
+    # Set up authentication
+    if not setup_authentication():
+        raise RuntimeError("Failed to set up authentication")
+
+    # Return the API client (kube-authkit handles this automatically)
+    return client.ApiClient()
+
+
+# ============================================================================
+# Token Refresh Logic for BYOIDC
+# ============================================================================
+
+
+def setup_token_refresh_monitoring():
+    """
+    Set up token refresh monitoring for BYOIDC authentication.
+    This monitors token expiration and attempts to refresh when needed.
+    """
+    try:
+
+        def monitor_token_expiration():
+            """Background thread to monitor and refresh tokens."""
+
+        # kube-authkit handles token refresh automatically
+        print(
+            "Note: kube-authkit handles token refresh automatically - no monitoring needed"
+        )
+
+    except Exception as e:
+        print(f"Note: Token refresh monitoring not needed with kube-authkit: {e}")
+
+
+def get_byoidc_issuer_url():
+    """
+    Get OIDC issuer URL from cluster Authentication resource.
+    """
+    try:
+        from kubernetes import client
+
+        custom_api = client.CustomObjectsApi()
+        auth_resource = custom_api.get_cluster_custom_object(
+            group="config.openshift.io",
+            version="v1",
+            plural="authentications",
+            name="cluster",
+        )
+
+        # Check oidcProviders first
+        spec = auth_resource.get("spec", {})
+        if "oidcProviders" in spec and spec["oidcProviders"]:
+            for provider in spec["oidcProviders"]:
+                issuer_url = provider.get("issuer", {}).get("issuerURL", "")
+                if issuer_url:
+                    return issuer_url
+
+        # Fallback: use hardcoded issuer URL for known BYOIDC clusters
+        return "https://keycloak.qe.rh-ods.com"
+
+    except Exception as e:
+        print(f"Could not get OIDC issuer URL from cluster: {e}")
+        # Fallback to hardcoded URL
+        return "https://keycloak.qe.rh-ods.com"
+
+
+def get_oidc_tokens(username, password, issuer_url):
+    """
+    Get OIDC tokens (id_token and refresh_token) for a user.
+    Based on opendatahub-tests implementation.
+    """
+    try:
+        import requests
+
+        # Construct token endpoint
+        if "/realms/" in issuer_url:
+            token_url = f"{issuer_url}/protocol/openid-connect/token"
+        else:
+            token_url = f"{issuer_url}/realms/openshift/protocol/openid-connect/token"
+
+        print(f"Requesting OIDC tokens from: {token_url}")
+
+        # Request tokens using password grant
+        data = {
+            "grant_type": "password",
+            "client_id": "oc-cli",
+            "username": username,
+            "password": password,
+            "scope": "openid profile email",
+        }
+
+        response = requests.post(token_url, data=data, verify=False, timeout=30)
+
+        if response.status_code == 200:
+            token_data = response.json()
+            id_token = token_data.get("id_token")
+            refresh_token = token_data.get("refresh_token")
+
+            if id_token and refresh_token:
+                print("✓ Successfully obtained OIDC tokens")
+                return id_token, refresh_token
+            else:
+                print("ERROR: Token response missing id_token or refresh_token")
+                return None, None
+        else:
+            print(f"ERROR: Token request failed with status {response.status_code}")
+            print(f"Response: {response.text}")
+            return None, None
+
+    except Exception as e:
+        print(f"Error getting OIDC tokens: {e}")
+        return None, None
+
+
+def setup_byoidc_user_context(username, password):
+    """
+    Set up BYOIDC user context using OIDC tokens for proper RBAC testing.
+    Based on opendatahub-tests implementation.
+
+    Args:
+        username (str): BYOIDC username (e.g., odh-user1)
+        password (str): BYOIDC password
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        print(f"Setting up BYOIDC user context for: {username}")
+
+        # Get OIDC issuer URL from cluster
+        issuer_url = get_byoidc_issuer_url()
+        if not issuer_url:
+            print("ERROR: Could not determine OIDC issuer URL")
+            return False
+
+        print(f"Using OIDC issuer: {issuer_url}")
+
+        # Get OIDC tokens for the user
+        id_token, refresh_token = get_oidc_tokens(username, password, issuer_url)
+        if not id_token or not refresh_token:
+            print("ERROR: Failed to get OIDC tokens")
+            return False
+
+        print("✓ Successfully obtained OIDC tokens")
+
+        # Get current cluster context info
+        current_context = run_oc_command(["config", "current-context"])
+        if not current_context:
+            print("ERROR: Could not get current context")
+            return False
+
+        cluster_name = run_oc_command(
+            [
+                "config",
+                "view",
+                "-o",
+                f'jsonpath={{.contexts[?(@.name=="{current_context}")].context.cluster}}',
+            ]
+        )
+        if not cluster_name:
+            print("ERROR: Could not get cluster name")
+            return False
+
+        # Set up OIDC user credentials in kubeconfig
+        oidc_issuer = (
+            f"{issuer_url}/realms/openshift"
+            if "/realms/" not in issuer_url
+            else issuer_url
+        )
+
+        # Configure OIDC user credentials
+        result = run_oc_command(
+            [
+                "config",
+                "set-credentials",
+                username,
+                "--auth-provider=oidc",
+                f"--auth-provider-arg=idp-issuer-url={oidc_issuer}",
+                "--auth-provider-arg=client-id=oc-cli",
+                "--auth-provider-arg=client-secret=",
+                f"--auth-provider-arg=refresh-token={refresh_token}",
+                f"--auth-provider-arg=id-token={id_token}",
+            ]
+        )
+
+        if result is None:
+            print("ERROR: Failed to set OIDC credentials")
+            return False
+
+        print("✓ Successfully configured OIDC user credentials")
+
+        # Create context for the user
+        result = run_oc_command(
+            [
+                "config",
+                "set-context",
+                username,
+                f"--cluster={cluster_name}",
+                f"--user={username}",
+            ]
+        )
+
+        if result is None:
+            print("ERROR: Failed to create user context")
+            return False
+
+        print("✓ Successfully created user context")
+
+        # Switch to user context
+        result = run_oc_command(["config", "use-context", username])
+        if result is None:
+            print("ERROR: Failed to switch to user context")
+            return False
+
+        print("✓ Successfully switched to user context")
+
+        # Verify the context switch worked
+        current_user = run_oc_command(["whoami"])
+        if current_user and current_user.strip() == username:
+            print(
+                f"✅ Successfully set up and switched to BYOIDC user context: {username}"
+            )
+            return True
+        else:
+            print(
+                f"ERROR: Context switch verification failed. Expected: {username}, Got: {current_user}"
+            )
+            return False
+
+    except Exception as e:
+        print(f"Error setting up BYOIDC user context: {e}")
+        return False

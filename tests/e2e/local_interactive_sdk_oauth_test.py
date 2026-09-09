@@ -1,7 +1,6 @@
 from codeflare_sdk import (
     Cluster,
     ClusterConfiguration,
-    TokenAuthentication,
     generate_cert,
 )
 
@@ -12,12 +11,16 @@ import ray
 from support import *
 
 
+@pytest.mark.skip(reason="Remote ray.init() is temporarily unsupported")
 @pytest.mark.openshift
 class TestRayLocalInteractiveOauth:
     def setup_method(self):
         initialize_kubernetes_client(self)
 
     def teardown_method(self):
+        # Clean up authentication if needed
+        if hasattr(self, "auth_instance"):
+            cleanup_authentication(self.auth_instance)
         delete_namespace(self)
         delete_kueue_resources(self)
 
@@ -30,12 +33,11 @@ class TestRayLocalInteractiveOauth:
     def run_local_interactives(self):
         ray_image = get_ray_image()
 
-        auth = TokenAuthentication(
-            token=run_oc_command(["whoami", "--show-token=true"]),
-            server=run_oc_command(["whoami", "--show-server=true"]),
-            skip_tls=True,
-        )
-        auth.login()
+        # Set up authentication based on detected method
+        auth_instance = authenticate_for_tests()
+
+        # Store auth instance for cleanup
+        self.auth_instance = auth_instance
 
         cluster_name = "test-ray-cluster-li"
 
@@ -44,6 +46,10 @@ class TestRayLocalInteractiveOauth:
                 namespace=self.namespace,
                 name=cluster_name,
                 num_workers=1,
+                head_memory_requests=6,
+                head_memory_limits=8,
+                head_cpu_requests=1,
+                head_cpu_limits=1,
                 worker_cpu_requests=1,
                 worker_cpu_limits=1,
                 worker_memory_requests=1,
@@ -52,8 +58,8 @@ class TestRayLocalInteractiveOauth:
                 verify_tls=False,
             )
         )
-        cluster.up()
-        cluster.wait_ready()
+        cluster.apply()
+        wait_ready_with_stuck_detection(cluster)
 
         generate_cert.generate_tls_cert(cluster_name, self.namespace)
         generate_cert.export_env(cluster_name, self.namespace)

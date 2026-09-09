@@ -1,7 +1,6 @@
 import sys
 import os
 
-from time import sleep
 
 from codeflare_sdk.ray.cluster.cluster import Cluster, ClusterConfiguration
 
@@ -22,11 +21,10 @@ cluster = Cluster(
         worker_memory_requests=1,
         worker_memory_limits=2,
         image=ray_image,
-        appwrapper=True,
     )
 )
 
-cluster.up()
+cluster.apply()
 
 cluster.status()
 

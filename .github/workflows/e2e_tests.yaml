@@ -5,23 +5,25 @@ on:
   pull_request:
     branches:
       - main
-      - 'release-*'
+      - "release-*"
+      - ray-jobs-feature
     paths-ignore:
-      - 'docs/**'
-      - '**.adoc'
-      - '**.md'
-      - 'LICENSE'
+      - "docs/**"
+      - "**.adoc"
+      - "**.md"
+      - "LICENSE"
 
 concurrency:
   group: ${{ github.head_ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
 env:
-  CODEFLARE_OPERATOR_IMG: "quay.io/project-codeflare/codeflare-operator:dev"
+  KUEUE_VERSION: v0.13.4
+  KUBERAY_VERSION: v1.4.2
 
 jobs:
   kubernetes:
-    runs-on: ubuntu-20.04-4core-gpu
+    runs-on: gpu-t4-4-core
 
     steps:
       - name: Checkout code
@@ -32,31 +34,14 @@ jobs:
       - name: Checkout common repo code
         uses: actions/checkout@v4
         with:
-          repository: 'project-codeflare/codeflare-common'
-          ref: 'main'
-          path: 'common'
-
-      - name: Checkout CodeFlare operator repository
-        uses: actions/checkout@v4
-        with:
-          repository: project-codeflare/codeflare-operator
-          path: codeflare-operator
-
-      - name: Set Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: './codeflare-operator/go.mod'
-          cache-dependency-path: "./codeflare-operator/go.sum"
-
-      - name: Set up gotestfmt
-        uses: gotesttools/gotestfmt-action@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: "project-codeflare/codeflare-common"
+          ref: "main"
+          path: "common"
 
       - name: Set up specific Python version
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.12'
           cache: 'pip' # caching pip dependencies
 
       - name: Setup NVidia GPU environment for KinD
@@ -70,16 +55,55 @@ jobs:
       - name: Install NVidia GPU operator for KinD
         uses: ./common/github-actions/nvidia-gpu-operator
 
-      - name: Deploy CodeFlare stack
+      - name: Deploy Kueue and KubeRay
         id: deploy
         run: |
-          cd codeflare-operator
-          echo Setting up CodeFlare stack
-          make setup-e2e
-          echo Deploying CodeFlare operator
-          make deploy -e IMG="${CODEFLARE_OPERATOR_IMG}" -e ENV="e2e"
-          kubectl wait --timeout=120s --for=condition=Available=true deployment -n openshift-operators codeflare-operator-manager
-          cd ..
+          # Install Kueue
+          echo "Installing Kueue ${KUEUE_VERSION}..."
+          kubectl apply --server-side -f https://github.com/kubernetes-sigs/kueue/releases/download/${KUEUE_VERSION}/manifests.yaml
+          kubectl wait --timeout=120s --for=condition=Available=true deployment -n kueue-system kueue-controller-manager
+
+          # Install KubeRay from opendatahub-io fork (has RHOAI features)
+          echo "Installing KubeRay ${KUBERAY_VERSION} from opendatahub-io..."
+          kubectl create -k "github.com/opendatahub-io/kuberay/ray-operator/config/default?ref=${KUBERAY_VERSION}"
+          kubectl wait --timeout=120s --for=condition=Available=true deployment kuberay-operator
+
+          # Create default Kueue resources for the tests
+          echo "Creating Kueue resources..."
+          kubectl apply -f - <<EOF
+          apiVersion: kueue.x-k8s.io/v1beta1
+          kind: ResourceFlavor
+          metadata:
+            name: default-flavor
+          ---
+          apiVersion: kueue.x-k8s.io/v1beta1
+          kind: ClusterQueue
+          metadata:
+            name: cluster-queue
+          spec:
+            namespaceSelector: {}
+            resourceGroups:
+            - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+              flavors:
+              - name: default-flavor
+                resources:
+                - name: cpu
+                  nominalQuota: 100
+                - name: memory
+                  nominalQuota: 100Gi
+                - name: nvidia.com/gpu
+                  nominalQuota: 10
+          ---
+          apiVersion: kueue.x-k8s.io/v1beta1
+          kind: LocalQueue
+          metadata:
+            name: local-queue
+            namespace: default
+            annotations:
+              kueue.x-k8s.io/default-queue: "true"
+          spec:
+            clusterQueue: cluster-queue
+          EOF
 
       - name: Add user to KinD
         uses: ./common/github-actions/kind-add-user
@@ -94,8 +118,10 @@ jobs:
           kubectl create clusterrolebinding sdk-user-namespace-creator --clusterrole=namespace-creator --user=sdk-user
           kubectl create clusterrole raycluster-creator --verb=get,list,create,delete,patch --resource=rayclusters
           kubectl create clusterrolebinding sdk-user-raycluster-creator --clusterrole=raycluster-creator --user=sdk-user
-          kubectl create clusterrole appwrapper-creator --verb=get,list,create,delete,patch --resource=appwrappers
-          kubectl create clusterrolebinding sdk-user-appwrapper-creator --clusterrole=appwrapper-creator --user=sdk-user
+          kubectl create clusterrole rayjob-creator --verb=get,list,create,delete,patch --resource=rayjobs
+          kubectl create clusterrolebinding sdk-user-rayjob-creator --clusterrole=rayjob-creator --user=sdk-user
+          kubectl create clusterrole rayjob-status-reader --verb=get,list,patch,update --resource=rayjobs/status
+          kubectl create clusterrolebinding sdk-user-rayjob-status-reader --clusterrole=rayjob-status-reader --user=sdk-user
           kubectl create clusterrole resourceflavor-creator --verb=get,list,create,delete --resource=resourceflavors
           kubectl create clusterrolebinding sdk-user-resourceflavor-creator --clusterrole=resourceflavor-creator --user=sdk-user
           kubectl create clusterrole clusterqueue-creator --verb=get,list,create,delete,patch --resource=clusterqueues
@@ -104,8 +130,12 @@ jobs:
           kubectl create clusterrolebinding sdk-user-localqueue-creator --clusterrole=localqueue-creator --user=sdk-user
           kubectl create clusterrole list-secrets --verb=get,list --resource=secrets
           kubectl create clusterrolebinding sdk-user-list-secrets --clusterrole=list-secrets --user=sdk-user
-          kubectl create clusterrole pod-creator --verb=get,list --resource=pods
+          kubectl create clusterrole pod-creator --verb=get,list,watch --resource=pods
           kubectl create clusterrolebinding sdk-user-pod-creator --clusterrole=pod-creator --user=sdk-user
+          kubectl create clusterrole service-reader --verb=get,list,watch --resource=services
+          kubectl create clusterrolebinding sdk-user-service-reader --clusterrole=service-reader --user=sdk-user
+          kubectl create clusterrole port-forward-pods --verb=create --resource=pods/portforward
+          kubectl create clusterrolebinding sdk-user-port-forward-pods-binding --clusterrole=port-forward-pods --user=sdk-user
           kubectl config use-context sdk-user
 
       - name: Run e2e tests
@@ -117,7 +147,7 @@ jobs:
           pip install poetry
           poetry install --with test,docs
           echo "Running e2e tests..."
-          poetry run pytest -v -s ./tests/e2e -m 'kind and nvidia_gpu' > ${CODEFLARE_TEST_OUTPUT_DIR}/pytest_output.log 2>&1
+          poetry run pytest -v -s ./tests/e2e/ -m 'kind and nvidia_gpu' > ${CODEFLARE_TEST_OUTPUT_DIR}/pytest_output.log 2>&1
         env:
           GRPC_DNS_RESOLVER: "native"
 
@@ -131,17 +161,17 @@ jobs:
           echo "Printing Pytest output logs"
           cat ${CODEFLARE_TEST_OUTPUT_DIR}/pytest_output.log
 
-      - name: Print CodeFlare operator logs
-        if: always() && steps.deploy.outcome == 'success'
-        run: |
-          echo "Printing CodeFlare operator logs"
-          kubectl logs -n openshift-operators --tail -1 -l app.kubernetes.io/name=codeflare-operator | tee ${CODEFLARE_TEST_OUTPUT_DIR}/codeflare-operator.log
-
       - name: Print KubeRay operator logs
         if: always() && steps.deploy.outcome == 'success'
         run: |
           echo "Printing KubeRay operator logs"
-          kubectl logs -n ray-system --tail -1 -l app.kubernetes.io/name=kuberay | tee ${CODEFLARE_TEST_OUTPUT_DIR}/kuberay.log
+          kubectl logs --tail -1 -l app.kubernetes.io/name=kuberay | tee ${CODEFLARE_TEST_OUTPUT_DIR}/kuberay.log
+
+      - name: Print Kueue controller logs
+        if: always() && steps.deploy.outcome == 'success'
+        run: |
+          echo "Printing Kueue controller logs"
+          kubectl logs -n kueue-system --tail -1 -l control-plane=controller-manager | tee ${CODEFLARE_TEST_OUTPUT_DIR}/kueue.log
 
       - name: Export all KinD pod logs
         uses: ./common/github-actions/kind-export-logs

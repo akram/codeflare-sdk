@@ -1,7 +1,13 @@
-from .appwrapper import AppWrapper, AppWrapperStatus, AWManager
-
 from .client import (
     RayJobClient,
+)
+
+from .rayjobs import (
+    RayJob,
+    ManagedClusterConfig,
+    RayJobDeploymentStatus,
+    CodeflareRayJobStatus,
+    RayJobInfo,
 )
 
 from .cluster import (

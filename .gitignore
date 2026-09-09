@@ -18,3 +18,6 @@ docs/sphinx/codeflare_sdk.*.rst
 docs/sphinx/codeflare_sdk.rst
 docs/sphinx/modules.rst
 .idea/
+.cursor/plans/
+.cursor/commands/
+/results

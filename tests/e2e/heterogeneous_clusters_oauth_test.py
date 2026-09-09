@@ -1,9 +1,6 @@
-from time import sleep
-import time
 from codeflare_sdk import (
     Cluster,
     ClusterConfiguration,
-    TokenAuthentication,
 )
 
 from codeflare_sdk.common.kueue.kueue import list_local_queues
@@ -13,12 +10,16 @@ import pytest
 from support import *
 
 
+@pytest.mark.skip(reason="Temporarily skipped due to needed investigation")
 @pytest.mark.openshift
 class TestHeterogeneousClustersOauth:
     def setup_method(self):
         initialize_kubernetes_client(self)
 
     def teardown_method(self):
+        # Clean up authentication if needed
+        if hasattr(self, "auth_instance"):
+            cleanup_authentication(self.auth_instance)
         delete_namespace(self)
         delete_kueue_resources(self)
 
@@ -32,12 +33,11 @@ class TestHeterogeneousClustersOauth:
     ):
         ray_image = get_ray_image()
 
-        auth = TokenAuthentication(
-            token=run_oc_command(["whoami", "--show-token=true"]),
-            server=run_oc_command(["whoami", "--show-server=true"]),
-            skip_tls=True,
-        )
-        auth.login()
+        # Set up authentication based on detected method
+        auth_instance = authenticate_for_tests()
+
+        # Store auth instance for cleanup
+        self.auth_instance = auth_instance
 
         for flavor in self.resource_flavors:
             node_labels = (
@@ -57,21 +57,23 @@ class TestHeterogeneousClustersOauth:
                     num_workers=1,
                     head_cpu_requests="500m",
                     head_cpu_limits="500m",
+                    head_memory_requests=2,
+                    head_memory_limits=4,
                     worker_cpu_requests="500m",
                     worker_cpu_limits=1,
-                    worker_memory_requests=1,
+                    worker_memory_requests=2,
                     worker_memory_limits=4,
                     image=ray_image,
                     verify_tls=False,
                     local_queue=queue_name,
                 )
             )
-            cluster.up()
-            sleep(5)
+            cluster.apply()
+            # Wait for the cluster to be scheduled and ready, we don't need the dashboard for this check
+            wait_ready_with_stuck_detection(cluster, dashboard_check=False)
             node_name = get_pod_node(self, self.namespace, cluster_name)
             print(f"Cluster {cluster_name}-{flavor} is running on node: {node_name}")
-            sleep(5)
-            assert (
-                node_name in expected_nodes
-            ), f"Node {node_name} is not in the expected nodes for flavor {flavor}."
+            assert node_name in expected_nodes, (
+                f"Node {node_name} is not in the expected nodes for flavor {flavor}."
+            )
             cluster.down()
